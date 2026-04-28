@@ -362,7 +362,7 @@ function App() {
                 )}
 
                 {currentStep === 'result' && (
-                  <div id="result-preview" className="mt-5 space-y-5">
+                  <div className="mt-5 space-y-5">
                     <div className="rounded-3xl border border-lime-300/30 bg-lime-300/10 p-5">
                       <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-lime-300 px-3 py-1 text-xs font-black text-black">
                         <BadgeCheck className="h-4 w-4" />
@@ -412,7 +412,7 @@ function App() {
       </section>
 
       <section className="relative mx-auto max-w-7xl px-5 pb-10 sm:px-8 lg:px-10">
-        <div className="overflow-hidden rounded-[2rem] border border-white/10 bg-gradient-to-r from-lime-300 via-cyan-200 to-fuchsia-300 p-1">
+        <div id="result-preview" className="scroll-mt-8 overflow-hidden rounded-[2rem] border border-white/10 bg-gradient-to-r from-lime-300 via-cyan-200 to-fuchsia-300 p-1">
           <div className="flex flex-col gap-5 rounded-[1.8rem] bg-[#080910] p-6 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <div className="mb-2 inline-flex items-center gap-2 text-sm font-black text-lime-200">
