@@ -238,6 +238,14 @@ function TelegramDashboard() {
           </header>
 
           <div className="mt-4 flex gap-2 overflow-x-auto pb-2 lg:hidden">
+            <MobileTab
+              active={false}
+              label="Канали"
+              onClick={() => {
+                setSelectedChannelId(null);
+                setView('home');
+              }}
+            />
             <MobileTab active={view === 'overview'} label="Головна" onClick={() => setView('overview')} />
             <MobileTab active={view === 'chat'} label="Чат" onClick={() => setView('chat')} />
             <MobileTab active={view === 'content'} label="Пости" onClick={() => setView('content')} />
