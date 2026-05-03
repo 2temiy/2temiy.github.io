@@ -2539,19 +2539,21 @@ async function handleDashboardApi(request, env, url) {
 
   try {
     const path   = url.pathname;
+    const method = request.method;
+    const isGet  = method === "GET";
     const chatId = url.searchParams.get("chat_id") || "";
 
     // GET /api/ping — проверка пароля
-    if (path === "/api/ping") return json({ ok: true });
+    if (path === "/api/ping" && isGet) return json({ ok: true });
 
     // GET /api/bot-info
-    if (path === "/api/bot-info") {
+    if (path === "/api/bot-info" && isGet) {
       const me = await tg(env, "getMe", {});
       return json({ username: me.username, first_name: me.first_name });
     }
 
     // GET /api/stats
-    if (path === "/api/stats" && chatId) {
+    if (path === "/api/stats" && chatId && isGet) {
       const warns = await env.DB.prepare(
         `SELECT SUM(count) as total FROM warns WHERE chat_id = ?`
       ).bind(chatId).first();
@@ -2587,7 +2589,7 @@ async function handleDashboardApi(request, env, url) {
     }
 
     // GET /api/settings
-    if (path === "/api/settings" && chatId) {
+    if (path === "/api/settings" && chatId && isGet) {
       const cfg = await getConfig(env.DB, chatId);
       return json(cfg);
     }
@@ -2619,7 +2621,7 @@ async function handleDashboardApi(request, env, url) {
     }
 
     // GET /api/staff
-    if (path === "/api/staff" && chatId) {
+    if (path === "/api/staff" && chatId && isGet) {
       const rows = await env.DB.prepare(
         `SELECT user_id, rank_level FROM staff WHERE chat_id = ? AND rank_level > 0 ORDER BY rank_level DESC`
       ).bind(chatId).all();
@@ -2635,7 +2637,7 @@ async function handleDashboardApi(request, env, url) {
     }
 
     // GET /api/log
-    if (path === "/api/log" && chatId) {
+    if (path === "/api/log" && chatId && isGet) {
       // Возвращаем последние варны как лог
       const rows = await env.DB.prepare(
         `SELECT w.user_id, w.count, w.updated_at, uc.display_name
@@ -2653,7 +2655,7 @@ async function handleDashboardApi(request, env, url) {
     }
 
     // GET /api/top
-    if (path === "/api/top" && chatId) {
+    if (path === "/api/top" && chatId && isGet) {
       const repRows = await env.DB.prepare(
         `SELECT r.user_id, r.rep, uc.display_name
          FROM reputation r LEFT JOIN user_cache uc ON uc.chat_id = r.chat_id AND uc.user_id = r.user_id
@@ -2673,7 +2675,7 @@ async function handleDashboardApi(request, env, url) {
     }
 
     // GET /api/clans
-    if (path === "/api/clans" && chatId) {
+    if (path === "/api/clans" && chatId && isGet) {
       const rows = await env.DB.prepare(
         `SELECT c.*, COUNT(cm.user_id) as members
          FROM clans c LEFT JOIN clan_members cm ON cm.clan_id = c.id
@@ -2684,7 +2686,7 @@ async function handleDashboardApi(request, env, url) {
     }
 
     // GET /api/rules
-    if (path === "/api/rules" && chatId) {
+    if (path === "/api/rules" && chatId && isGet) {
       const cfg = await getConfig(env.DB, chatId);
       return json({ rules: cfg.rules_text || "" });
     }
@@ -2698,7 +2700,7 @@ async function handleDashboardApi(request, env, url) {
 
     // ── ЧАТЫ ─────────────────────────────────────────────────────────────
     // GET /api/chats — список всех чатов, в которых есть бот
-    if (path === "/api/chats") {
+    if (path === "/api/chats" && isGet) {
       const rows = await env.DB.prepare(
         `SELECT chat_id, title, type, username, member_count, last_seen, removed
          FROM chat_meta ORDER BY removed ASC, last_seen DESC`
@@ -2713,7 +2715,7 @@ async function handleDashboardApi(request, env, url) {
     }
 
     // GET /api/chat-info?chat_id=... — свежие данные о чате
-    if (path === "/api/chat-info" && chatId) {
+    if (path === "/api/chat-info" && chatId && isGet) {
       try {
         const info = await tg(env, "getChat", { chat_id: chatId });
         let member_count = 0;
@@ -2767,7 +2769,7 @@ async function handleDashboardApi(request, env, url) {
 
     // ── СООБЩЕНИЯ ────────────────────────────────────────────────────────
     // GET /api/messages?chat_id=&limit=&before_id=
-    if (path === "/api/messages" && chatId) {
+    if (path === "/api/messages" && chatId && isGet) {
       const limit  = Math.max(1, Math.min(200, Number(url.searchParams.get("limit")) || 50));
       const before = Number(url.searchParams.get("before_id")) || 0;
       const rows = before
@@ -2816,7 +2818,7 @@ async function handleDashboardApi(request, env, url) {
 
     // ── УЧАСТНИКИ ────────────────────────────────────────────────────────
     // GET /api/members?chat_id=&q=&limit=
-    if (path === "/api/members" && chatId) {
+    if (path === "/api/members" && chatId && isGet) {
       const q = (url.searchParams.get("q") || "").trim().toLowerCase();
       const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 200));
       const rows = q
