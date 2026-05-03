@@ -507,6 +507,7 @@ function enterApp() {
 }
 function logout() {
   PASSWORD = ''; CHAT_ID = ''; CURRENT_CHAT = null;
+  if (FEED_TIMER) { clearInterval(FEED_TIMER); FEED_TIMER = null; }
   try { sessionStorage.removeItem('botpwd'); } catch {}
   document.getElementById('login-screen').style.display = 'flex';
   document.getElementById('app').style.display = 'none';
@@ -707,16 +708,34 @@ async function loadChatInfo() {
 function renderMsg(m, withTools) {
   const kind = m.kind && m.kind !== 'text' ? '<span class="msg-kind">[' + esc(m.kind) + ']</span>' : '';
   const tools = withTools
-    ? '<div class="msg-tools"><button class="btn btn-sm btn-danger" onclick="deleteMsg(' + m.message_id + ')">🗑 Удалить</button>'
-      + '<button class="btn btn-sm" onclick="document.getElementById(\\'pin-id\\').value=' + m.message_id + ';showTab(\\'manage\\')">📌 Закрепить</button>'
-      + '<button class="btn btn-sm" onclick="banUser(\\'' + m.user_id + '\\',\\'' + esc(m.user_name).replace(/\\'/g,\"\\\\'\") + '\\')">🔨 Бан автора</button></div>'
+    ? '<div class="msg-tools">'
+      + '<button class="btn btn-sm btn-danger" data-msg-act="delete">🗑 Удалить</button>'
+      + '<button class="btn btn-sm" data-msg-act="pin">📌 Закрепить</button>'
+      + '<button class="btn btn-sm" data-msg-act="ban">🔨 Бан автора</button>'
+      + '</div>'
     : '';
-  return '<div class="msg" data-mid="' + m.message_id + '">'
-    + '<div class="msg-head"><span class="msg-author">' + esc(m.user_name || 'user_' + m.user_id) + '</span><span class="msg-time">' + esc(fmtTime(m.ts)) + '</span></div>'
+  const uname = esc(m.user_name || 'user_' + m.user_id);
+  return '<div class="msg" data-mid="' + Number(m.message_id) + '" data-uid="' + esc(m.user_id) + '" data-uname="' + uname + '">'
+    + '<div class="msg-head"><span class="msg-author">' + uname + '</span><span class="msg-time">' + esc(fmtTime(m.ts)) + '</span></div>'
     + (m.text ? '<div class="msg-text">' + esc(m.text) + '</div>' : '<div class="msg-text muted">(без текста)</div>')
     + (kind ? '<div>' + kind + '</div>' : '')
     + tools
     + '</div>';
+}
+function wireFeedButtons(rootEl) {
+  rootEl.querySelectorAll('.msg[data-mid]').forEach(row => {
+    const mid = Number(row.dataset.mid);
+    const uid = row.dataset.uid;
+    const uname = row.dataset.uname;
+    row.querySelectorAll('button[data-msg-act]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const a = btn.dataset.msgAct;
+        if (a === 'delete') deleteMsg(mid);
+        else if (a === 'pin') { document.getElementById('pin-id').value = mid; showTab('manage'); }
+        else if (a === 'ban') banUser(uid, uname);
+      });
+    });
+  });
 }
 async function loadFeed(silent) {
   const el = document.getElementById('feed');
@@ -726,6 +745,7 @@ async function loadFeed(silent) {
     document.getElementById('feed-meta').textContent = (d.messages || []).length + ' сообщений';
     if (!d.messages?.length) { el.innerHTML = '<div class="empty-state small">Сообщений нет</div>'; return; }
     el.innerHTML = d.messages.map(m => renderMsg(m, true)).join('');
+    wireFeedButtons(el);
   } catch (e) { if (!silent) el.innerHTML = '<div class="empty-state small">Ошибка: ' + esc(String(e)) + '</div>'; }
 }
 async function deleteMsg(mid) {
@@ -760,21 +780,32 @@ async function loadMembers() {
     el.innerHTML = d.members.map(m => {
       const name = esc(m.display_name || ('user_' + m.user_id));
       const uname = m.username ? '@' + esc(m.username) : '';
-      const safeName = name.replace(/'/g, "\\'");
-      return '<div class="list-row">'
+      return '<div class="list-row" data-uid="' + esc(m.user_id) + '" data-name="' + name + '" data-rank="' + (m.rank_level || 0) + '">'
         + '<div class="chat-avatar" style="width:36px;height:36px;font-size:13px;border-radius:10px;flex-shrink:0">' + esc(initials(m.display_name || 'U')) + '</div>'
         + '<div class="grow">'
         +   '<div class="list-name">' + name + ' ' + rankBadge(m.rank_level) + '</div>'
         +   '<div class="list-sub">' + uname + ' · id ' + esc(m.user_id) + ' · ⚠ ' + (m.warns||0) + ' · ★ ' + (m.rep||0) + '</div>'
         + '</div>'
         + '<div class="row-actions">'
-        +   '<button class="btn btn-sm" onclick="muteUser(\\'' + m.user_id + '\\',\\'' + safeName + '\\')">🔇 Мут</button>'
-        +   '<button class="btn btn-sm" onclick="kickUser(\\'' + m.user_id + '\\',\\'' + safeName + '\\')">👢 Кик</button>'
-        +   '<button class="btn btn-sm btn-danger" onclick="banUser(\\'' + m.user_id + '\\',\\'' + safeName + '\\')">🔨 Бан</button>'
-        +   '<button class="btn btn-sm" onclick="setRankPrompt(\\'' + m.user_id + '\\',\\'' + safeName + '\\',' + (m.rank_level || 0) + ')">⚙ Ранг</button>'
+        +   '<button class="btn btn-sm" data-mem-act="mute">🔇 Мут</button>'
+        +   '<button class="btn btn-sm" data-mem-act="kick">👢 Кик</button>'
+        +   '<button class="btn btn-sm btn-danger" data-mem-act="ban">🔨 Бан</button>'
+        +   '<button class="btn btn-sm" data-mem-act="rank">⚙ Ранг</button>'
         + '</div>'
         + '</div>';
     }).join('');
+    el.querySelectorAll('.list-row[data-uid]').forEach(row => {
+      const uid = row.dataset.uid, nm = row.dataset.name, rk = Number(row.dataset.rank) || 0;
+      row.querySelectorAll('button[data-mem-act]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const a = btn.dataset.memAct;
+          if (a === 'mute') muteUser(uid, nm);
+          else if (a === 'kick') kickUser(uid, nm);
+          else if (a === 'ban') banUser(uid, nm);
+          else if (a === 'rank') setRankPrompt(uid, nm, rk);
+        });
+      });
+    });
   } catch (e) { el.innerHTML = '<div class="empty-state small">Ошибка: ' + esc(String(e)) + '</div>'; }
 }
 async function kickUser(uid, name) {
@@ -808,15 +839,23 @@ async function loadStaff() {
     const d = await apiGet('/api/staff?chat_id=' + CHAT_ID);
     if (!d.staff?.length) { el.innerHTML = '<div class="empty-state small">Стаффа пока нет</div>'; return; }
     el.innerHTML = d.staff.map(s => {
-      const safeName = esc(s.name).replace(/'/g, "\\'");
-      return '<div class="list-row">'
+      return '<div class="list-row" data-uid="' + esc(s.user_id) + '" data-name="' + esc(s.name) + '" data-rank="' + (s.rank || 0) + '">'
         + '<div class="chat-avatar" style="width:36px;height:36px;font-size:13px;border-radius:10px;flex-shrink:0">' + esc(initials(s.name)) + '</div>'
         + '<div class="grow"><div class="list-name">' + esc(s.name) + ' ' + rankBadge(s.rank) + '</div><div class="list-sub">id ' + esc(s.user_id) + '</div></div>'
         + '<div class="row-actions">'
-        +   '<button class="btn btn-sm" onclick="setRankPrompt(\\'' + s.user_id + '\\',\\'' + safeName + '\\',' + s.rank + ')">⚙ Ранг</button>'
-        +   '<button class="btn btn-sm btn-danger" onclick="setRankZero(\\'' + s.user_id + '\\',\\'' + safeName + '\\')">✖ Снять</button>'
+        +   '<button class="btn btn-sm" data-staff-act="rank">⚙ Ранг</button>'
+        +   '<button class="btn btn-sm btn-danger" data-staff-act="unrank">✖ Снять</button>'
         + '</div></div>';
     }).join('');
+    el.querySelectorAll('.list-row[data-uid]').forEach(row => {
+      const uid = row.dataset.uid, nm = row.dataset.name, rk = Number(row.dataset.rank) || 0;
+      row.querySelectorAll('button[data-staff-act]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (btn.dataset.staffAct === 'rank') setRankPrompt(uid, nm, rk);
+          else if (btn.dataset.staffAct === 'unrank') setRankZero(uid, nm);
+        });
+      });
+    });
   } catch (e) { el.innerHTML = '<div class="empty-state small">Ошибка: ' + esc(String(e)) + '</div>'; }
 }
 async function setRankZero(uid, name) {
