@@ -8,10 +8,8 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
-  Crown,
   Edit3,
   Eye,
-  Hash,
   Lock,
   MessageCircle,
   MessageSquareText,
@@ -254,7 +252,13 @@ function TelegramDashboard() {
             {view === 'content' && <ContentPanel message={message} setMessage={setMessage} />}
             {view === 'moderation' && <ModerationPanel />}
             {view === 'settings' && (
-              <SettingsPanel rules={rules} setRules={setRules} settings={settings} toggleSetting={toggleSetting} />
+              <SettingsPanel
+                channel={selectedChannel}
+                rules={rules}
+                setRules={setRules}
+                settings={settings}
+                toggleSetting={toggleSetting}
+              />
             )}
             {view === 'danger' && (
               <DangerPanel channel={selectedChannel} deleteConfirm={deleteConfirm} setDeleteConfirm={setDeleteConfirm} />
@@ -561,11 +565,13 @@ function ModerationPanel() {
 }
 
 function SettingsPanel({
+  channel,
   rules,
   setRules,
   settings,
   toggleSetting,
 }: {
+  channel: Channel;
   rules: string;
   setRules: React.Dispatch<React.SetStateAction<string>>;
   settings: Record<SettingKey, boolean>;
@@ -577,8 +583,8 @@ function SettingsPanel({
         <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-100/70">Channel editor</p>
         <h2 className="mt-1 text-2xl font-black">Редагувати канал</h2>
         <div className="mt-5 grid gap-4">
-          <Field label="Назва каналу" value="2temiy Community" />
-          <Field label="Username" value="@twotemiy_chat" />
+          <Field label="Назва каналу" value={channel.name} />
+          <Field label="Username" value={channel.handle} />
           <label className="block">
             <span className="mb-2 block text-sm font-bold text-white/55">Правила</span>
             <textarea
@@ -828,7 +834,7 @@ function SwitchRow({ label, enabled, onClick }: { label: string; enabled: boolea
     <button onClick={onClick} className="flex w-full items-center justify-between rounded-2xl border border-white/10 bg-white/[0.04] p-4 text-left">
       <span className="font-bold">{label}</span>
       <span className={`relative h-7 w-12 rounded-full transition ${enabled ? 'bg-cyan-300' : 'bg-white/15'}`}>
-        <span className={`absolute top-1 h-5 w-5 rounded-full bg-black transition ${enabled ? 'left-6' : 'left-1 bg-white'}`} />
+        <span className={`absolute top-1 h-5 w-5 rounded-full transition ${enabled ? 'left-6 bg-black' : 'left-1 bg-white'}`} />
       </span>
     </button>
   );
