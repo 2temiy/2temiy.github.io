@@ -84,16 +84,7 @@ export default {
       }
 
       if (pwd !== expected) {
-        return new Response(JSON.stringify({
-          error: "forbidden",
-          debug: {
-            hasEnv: !!env.DASHBOARD_PASSWORD,
-            pwdLen: pwd.length,
-            expectedLen: expected.length,
-            headerPresent: request.headers.has("x-dashboard-password"),
-            queryPresent: url.searchParams.has("pwd"),
-          }
-        }), {
+        return new Response(JSON.stringify({ error: "forbidden" }), {
           status: 403, headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
         });
       }
@@ -222,17 +213,6 @@ async function handleUpdate(update, env) {
 
   if (cmd === "/help" || cmd === "/modhelp") {
     await sendHelpMenu(env, msg, chatId);
-    return;
-  }
-
-  if (cmd && CMD_LEVEL[cmd] !== undefined) {
-    const lvl = await getLevel(env, chatId, userId);
-    const min = CMD_LEVEL[cmd];
-    if (lvl >= min) {
-      await doCommand(msg, cmd, text, env, cfg, lvl);
-    } else if (lvl >= 1) {
-      await tempReply(env, msg, `❌ Нужен ранг: *${rank(min).icon} ${rank(min).label}*`);
-    }
     return;
   }
 
@@ -3687,7 +3667,6 @@ function enterChat(c) {
   document.getElementById('chat-panel').style.display = 'block';
   renderCrumbs();
   showTab('dashboard');
-  loadChatInfo();
 }
 
 // ── TABS ─────────────────────────────────────────────────────────
