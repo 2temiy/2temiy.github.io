@@ -554,7 +554,7 @@ function chatTypeBadge(type) {
   const cls = type === 'channel' ? 'badge-blue' : type === 'private' ? 'badge-gray' : 'badge-accent';
   return '<span class="badge ' + cls + '">' + esc(map[type] || type || '?') + '</span>';
 }
-function initials(s) { const parts = String(s || '').trim().split(/\\s+/).filter(Boolean); return ((parts[0] || '?')[0] + (parts[1] ? parts[1][0] : '')).toUpperCase(); }
+function initials(s) { const parts = String(s || '').trim().split(/\s+/).filter(Boolean); return ((parts[0] || '?')[0] + (parts[1] ? parts[1][0] : '')).toUpperCase(); }
 function num(n) { n = Number(n) || 0; return n.toLocaleString('ru-RU'); }
 
 // ── BOT NAME ─────────────────────────────────────────────────────
@@ -942,9 +942,9 @@ async function loadSettings() {
     document.getElementById('settings-numbers').innerHTML = NUM_DEFS.map(n => {
       const v = Number(d[n.field]) || n.min;
       return '<div class="setting-row"><div class="grow"><div class="setting-label">' + n.label + '</div><div class="setting-desc">от ' + n.min + ' до ' + n.max + '</div></div>'
-        + '<div class="num-row"><button class="num-btn" onclick="numChange(\\'' + n.key + '\\',-1)">−</button>'
+        + '<div class="num-row"><button class="num-btn" onclick="numChange(\'' + n.key + '\',-1)">−</button>'
         +   '<span class="num-val" id="num-' + n.key + '">' + v + '</span>'
-        +   '<button class="num-btn" onclick="numChange(\\'' + n.key + '\\',1)">+</button></div></div>';
+        +   '<button class="num-btn" onclick="numChange(\'' + n.key + '\',1)">+</button></div></div>';
     }).join('');
     document.getElementById('welcome-text').value = d.welcome_text || '';
     document.getElementById('bad-words').value    = d.bad_words   || '';
