@@ -479,6 +479,7 @@ let PASSWORD = '';
 let CHAT_ID  = '';
 let CURRENT_CHAT = null;
 let FEED_TIMER = null;
+let CHATS_LIST = [];
 
 const RANK_ICONS = ['👤','🟢','🔵','🟣','🟡','🟠','🔴','⭐'];
 const RANK_NAMES = ['Участник','Мл. модератор','Модератор','Ст. модератор','Мл. админ','Админ','Ст. админ','Овнер'];
@@ -590,7 +591,8 @@ async function loadChats() {
       grid.innerHTML = '<div class="empty-state"><h3>Чатов пока нет</h3>Добавь бота в группу или канал, и он появится здесь автоматически после первого сообщения.<div class="mt-12"><button class="btn btn-accent" onclick="refreshAllChats()">⤴ Подтянуть из Telegram</button></div></div>';
       return;
     }
-    grid.innerHTML = chats.map(c => {
+    CHATS_LIST = chats;
+    grid.innerHTML = chats.map((c, idx) => {
       const removed = !!c.removed;
       const title = c.title || ('chat ' + c.chat_id);
       const tags = [
@@ -598,7 +600,7 @@ async function loadChats() {
         c.username ? '<span class="badge badge-blue">@' + esc(c.username) + '</span>' : '',
         removed ? '<span class="badge badge-red">бот вышел</span>' : '',
       ].filter(Boolean).join(' ');
-      return '<div class="chat-card ' + (removed ? 'removed' : '') + '" onclick="enterChat(' + JSON.stringify(c).replace(/"/g, '&quot;') + ')">'
+      return '<div class="chat-card ' + (removed ? 'removed' : '') + '" data-chat-idx="' + idx + '">'
         + '<div class="chat-avatar">' + esc(initials(title)) + '</div>'
         + '<div class="chat-name">' + esc(title) + '</div>'
         + '<div class="chat-meta">'
@@ -610,6 +612,13 @@ async function loadChats() {
         + '<div class="small muted mt-12">id: ' + esc(c.chat_id) + '</div>'
         + '</div>';
     }).join('');
+    grid.querySelectorAll('.chat-card[data-chat-idx]').forEach(card => {
+      card.addEventListener('click', () => {
+        const i = Number(card.dataset.chatIdx);
+        const c = CHATS_LIST[i];
+        if (c) enterChat(c);
+      });
+    });
   } catch (e) {
     grid.innerHTML = '<div class="empty-state"><h3>Ошибка</h3>' + esc(String(e)) + '</div>';
   }
