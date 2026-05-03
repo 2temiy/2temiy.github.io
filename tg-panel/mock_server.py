@@ -104,6 +104,21 @@ CHATS = [
         "last_seen": START_TS - 300,
         "removed": 0,
     },
+    {
+        # Adversarial chat title: in the buggy build, `JSON.stringify(c).replace(/"/g,'&quot;')`
+        # produces an onclick attribute whose HTML entity sequences (&#34;) decode back to
+        # a literal " — closing the JS string and executing alert(). With the fixed
+        # data-chat-idx + addEventListener, no chat data ever crosses into HTML attributes.
+        "chat_id": "-1005555555555",
+        "title": "&#34;+alert('XSS_FROM_TITLE')+&#34;",
+        "type": "group",
+        "username": "evil_chat",
+        "member_count": 7,
+        "messages_logged": 0,
+        "first_seen": START_TS - 60,
+        "last_seen": START_TS - 30,
+        "removed": 0,
+    },
 ]
 
 
@@ -218,16 +233,20 @@ class Handler(BaseHTTPRequestHandler):
                 "top_violators": [{"name": m["display_name"], "warns": m["warns"]} for m in top],
             })
 
-        if path == "/api/modlog":
+        if path == "/api/log":
+            # Dashboard reads entries[].action, entries[].user, entries[].ts
             return jbody(self, 200, {"ok": True, "entries": [
-                {"ts": START_TS - 100, "actor": "Alice", "action": "ban", "target": "Bob", "reason": "флуд"},
+                {"action": "Варны: 7", "user": "');alert('XSS_FROM_NAME');//", "ts": START_TS - 50},
+                {"action": "Варны: 4", "user": "<img src=x onerror=alert('XSS_FROM_IMG')>", "ts": START_TS - 100},
+                {"action": "Варны: 2", "user": "Bob", "ts": START_TS - 200},
             ]})
 
         if path == "/api/top":
+            # Dashboard reads d.top_rep[].rep and d.top_warns[].count
             return jbody(self, 200, {
                 "ok": True,
-                "rep": [{"name": m["display_name"], "rep": m["rep"]} for m in MEMBERS if m["rep"] > 0],
-                "warns": [{"name": m["display_name"], "warns": m["warns"]} for m in MEMBERS if m["warns"] > 0],
+                "top_rep":   [{"name": m["display_name"], "rep":   m["rep"]}   for m in MEMBERS if m["rep"]   > 0],
+                "top_warns": [{"name": m["display_name"], "count": m["warns"]} for m in MEMBERS if m["warns"] > 0],
             })
 
         if path == "/api/clans":

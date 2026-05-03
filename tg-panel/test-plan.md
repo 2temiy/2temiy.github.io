@@ -59,6 +59,16 @@ The fix replaces inline `onclick` handlers with `addEventListener` + `data-*` at
 - **Action:** Click "🔧 Управление" tab. Click "Бот покидает чат и удаляет данные" without checking the confirmation checkbox.
 - **Expected pass:** A toast/alert says "Подтверди удаление" or similar, no network request to `/api/delete-chat` is made.
 
+### T8 — Chat-picker: HTML-entity payload in chat title does NOT execute (commit `11971a4`)
+- **Critical assertion of the second XSS fix.**
+- **Action:** Open the chat picker. The mock returns a chat with `title = "&#34;+alert('XSS_FROM_TITLE')+&#34;"`.
+- **Expected pass:**
+  - No `alert()` dialog fires while the picker renders.
+  - The chat card renders the title as the literal text `&#34;+alert('XSS_FROM_TITLE')+&#34;` (HTML entities visibly preserved because the dashboard escapes through `esc()` and never injects raw entities into an attribute).
+  - DOM inspection: the card uses `data-chat-idx="2"` (no embedded JSON in `onclick`).
+  - Clicking the card calls `enterChat(CHATS_LIST[2])` with the literal object — observable as the card opening the per-chat panel without firing `alert`.
+- **Would-fail-if-broken:** In the previous build, `JSON.stringify(c).replace(/"/g, '&quot;')` produced an `onclick` attribute whose `&#34;` sequences were decoded by the HTML parser into bare `"` characters, breaking out of the JS string and executing `alert('XSS_FROM_TITLE')`.
+
 ## Skipped / out of scope
 - Real Telegram delivery (no live bot). Send/Kick/Ban only verified end-to-end against the mock — confirms the dashboard wires the API call, not Telegram-side semantics.
 - CSS visual polish.
