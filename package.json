@@ -1,5 +1,5 @@
 {
-  "name": "nebula-script-executor",
+  "name": "tg-control",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -9,12 +9,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "@google/genai": "^1.30.0",
     "lucide-react": "^0.554.0",
-    "react-markdown": "^10.1.0",
-    "@monaco-editor/react": "^4.7.0"
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
