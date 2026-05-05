@@ -1249,8 +1249,11 @@ async function banUser(uid, name) {
   catch { showToast('Ошибка', 'error'); }
 }
 async function muteUser(uid, name) {
-  const sec = prompt('Длительность мута в секундах (60–86400):', '3600'); if (!sec) return;
-  try { const r = await apiPost('/api/mute', { chat_id: CHAT_ID, user_id: uid, duration_sec: Number(sec) }); r.ok ? showToast(name + ' замучен', 'success') : showToast(r.error || 'Ошибка', 'error'); }
+  const sec = prompt('Длительность мута в секундах (60–86400, 0 = НАВСЕГДА):', '3600');
+  if (sec === null || sec === '') return;
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n < 0) { showToast('Некорректное число', 'error'); return; }
+  try { const r = await apiPost('/api/mute', { chat_id: CHAT_ID, user_id: uid, duration_sec: n }); r.ok ? showToast(name + ' замучен' + (n === 0 ? ' (навсегда)' : ''), 'success') : showToast(r.error || 'Ошибка', 'error'); }
   catch { showToast('Ошибка', 'error'); }
 }
 async function setRankPrompt(uid, name, current) {

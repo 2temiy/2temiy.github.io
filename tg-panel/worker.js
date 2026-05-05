@@ -3277,7 +3277,14 @@ async function handleDashboardApi(request, env, url) {
       if (!cid || !action || !ids.length) return json({ error: "chat_id, action, user_ids required" }, 400);
       const allowed = ["kick", "ban", "unban", "mute", "unmute", "setrank"];
       if (!allowed.includes(action)) return json({ error: "unknown action" }, 400);
-      const dur = Math.max(60, Number(body.duration_sec) || 3600);
+      // dur=0 means permanent (until_date=0 in Telegram). Treat undefined as
+      // default 1h (legacy callers) but accept explicit 0 as "forever".
+      const _raw = body.duration_sec;
+      const _provided = _raw !== undefined && _raw !== null && _raw !== "";
+      const _num = Number(_raw);
+      const dur = !_provided
+        ? 3600
+        : (Number.isFinite(_num) && _num > 0 ? Math.max(60, _num) : 0);
       const lvl = Math.max(0, Math.min(7, Number(body.level) || 0));
       let ok = 0, errors = [];
       for (const uid of ids) {
@@ -3292,7 +3299,7 @@ async function handleDashboardApi(request, env, url) {
             await tg(env, "unbanChatMember", { chat_id: cid, user_id: u, only_if_banned: true });
           } else if (action === "mute") {
             await tg(env, "restrictChatMember", {
-              chat_id: cid, user_id: u, until_date: nowTs() + dur,
+              chat_id: cid, user_id: u, until_date: dur === 0 ? 0 : (nowTs() + dur),
               permissions: { can_send_messages: false, can_send_audios: false, can_send_documents: false, can_send_photos: false, can_send_videos: false, can_send_video_notes: false, can_send_voice_notes: false, can_send_polls: false, can_send_other_messages: false, can_add_web_page_previews: false },
             });
           } else if (action === "unmute") {
@@ -3413,10 +3420,20 @@ async function handleDashboardApi(request, env, url) {
     }
 
     // POST /api/mute { chat_id, user_id, duration_sec }
+    // duration_sec semantics:
+    //   undefined / null  -> default 1h
+    //   0                 -> permanent (Telegram treats until_date=0 as forever)
+    //   >0                -> clamped to >=60 seconds
     if (path === "/api/mute" && request.method === "POST") {
       const body = await request.json();
       try {
-        const until = nowTs() + Math.max(60, Number(body.duration_sec) || 3600);
+        const raw = body.duration_sec;
+        const provided = raw !== undefined && raw !== null && raw !== "";
+        const num = Number(raw);
+        const dur = !provided
+          ? 3600
+          : (Number.isFinite(num) && num > 0 ? Math.max(60, num) : 0);
+        const until = dur === 0 ? 0 : nowTs() + dur;
         await tg(env, "restrictChatMember", {
           chat_id: body.chat_id, user_id: Number(body.user_id),
           until_date: until,
@@ -3426,7 +3443,7 @@ async function handleDashboardApi(request, env, url) {
             can_change_info: false, can_invite_users: false, can_pin_messages: false,
           },
         });
-        return json({ ok: true, until });
+        return json({ ok: true, until, permanent: dur === 0 });
       } catch (err) { return json({ ok: false, error: String(err) }, 200); }
     }
 
@@ -4917,8 +4934,11 @@ async function banUser(uid, name) {
   catch { showToast('Ошибка', 'error'); }
 }
 async function muteUser(uid, name) {
-  const sec = prompt('Длительность мута в секундах (60–86400):', '3600'); if (!sec) return;
-  try { const r = await apiPost('/api/mute', { chat_id: CHAT_ID, user_id: uid, duration_sec: Number(sec) }); r.ok ? showToast(name + ' замучен', 'success') : showToast(r.error || 'Ошибка', 'error'); }
+  const sec = prompt('Длительность мута в секундах (60–86400, 0 = НАВСЕГДА):', '3600');
+  if (sec === null || sec === '') return;
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n < 0) { showToast('Некорректное число', 'error'); return; }
+  try { const r = await apiPost('/api/mute', { chat_id: CHAT_ID, user_id: uid, duration_sec: n }); r.ok ? showToast(name + ' замучен' + (n === 0 ? ' (навсегда)' : ''), 'success') : showToast(r.error || 'Ошибка', 'error'); }
   catch { showToast('Ошибка', 'error'); }
 }
 async function setRankPrompt(uid, name, current) {
