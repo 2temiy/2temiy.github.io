@@ -2980,22 +2980,134 @@ async function handleDashboardApi(request, env, url) {
       } catch (err) { return json({ ok: false, error: String(err) }, 200); }
     }
 
-    // ── УДАЛЕНИЕ (бот выходит + чистим D1) ───────────────────────────────
-    // POST /api/delete-chat { chat_id, wipe? }
-    if (path === "/api/delete-chat" && request.method === "POST") {
+    // ── РЕДАКТИРОВАНИЕ ПОСТА (для каналов и групп) ──────────────────────
+    // POST /api/edit-message { chat_id, message_id, text, parse_mode? }
+    if (path === "/api/edit-message" && request.method === "POST") {
+      const body = await request.json();
+      const cid  = String(body.chat_id || "");
+      const mid  = Number(body.message_id || 0);
+      const text = String(body.text || "");
+      if (!cid || !mid) return json({ error: "chat_id and message_id required" }, 400);
+      if (!text)        return json({ error: "text required (use /api/delete-message to remove)" }, 400);
+      try {
+        // editMessageText работает и для каналов, и для групп. Если пост — медиа,
+        // Telegram вернёт ошибку и мы попробуем editMessageCaption.
+        const params = { chat_id: cid, message_id: mid, text };
+        if (body.parse_mode) params.parse_mode = String(body.parse_mode);
+        try {
+          await tg(env, "editMessageText", params);
+        } catch (err) {
+          const msg = String(err);
+          if (msg.includes("there is no text in the message to edit")) {
+            const cap = { chat_id: cid, message_id: mid, caption: text };
+            if (body.parse_mode) cap.parse_mode = String(body.parse_mode);
+            await tg(env, "editMessageCaption", cap);
+          } else { throw err; }
+        }
+        // Обновим кэш в chat_messages, чтобы в ленте сразу было видно.
+        try {
+          await env.DB.prepare(
+            `UPDATE chat_messages SET text = ? WHERE chat_id = ? AND message_id = ?`
+          ).bind(text, cid, mid).run();
+        } catch {}
+        return json({ ok: true });
+      } catch (err) {
+        return json({ ok: false, error: String(err) }, 200);
+      }
+    }
+
+    // ── ЗАЧИСТКА (кик всех + удалить все известные сообщения) ────────────
+    // POST /api/purge-chat { chat_id, kick?, delete_messages?, also_leave? }
+    if (path === "/api/purge-chat" && request.method === "POST") {
       const body = await request.json();
       const cid  = String(body.chat_id || "");
       if (!cid) return json({ error: "chat_id required" }, 400);
 
-      let leftOk = false, leftErr = null;
-      try {
-        await tg(env, "leaveChat", { chat_id: cid });
-        leftOk = true;
-      } catch (err) {
-        leftErr = String(err);
+      const doKick   = body.kick           !== false;
+      const doDelete = body.delete_messages !== false;
+      const doLeave  = body.also_leave      === true;
+
+      let kicked = 0, kickErrors = [];
+      let deleted = 0, deleteErrors = [];
+
+      // Кто я (не себя кикать)
+      let meId = null;
+      try { const me = await tg(env, "getMe", {}); meId = String(me.id); } catch {}
+
+      if (doKick) {
+        const users = await env.DB.prepare(
+          `SELECT user_id FROM user_cache WHERE chat_id = ?`
+        ).bind(cid).all();
+        for (const u of users.results || []) {
+          const uid = String(u.user_id);
+          if (!uid || uid === meId) continue;
+          try {
+            // Узнать статус — администраторов и создателя бот кикнуть не может.
+            const m = await tg(env, "getChatMember", { chat_id: cid, user_id: uid });
+            if (m && (m.status === "creator" || m.status === "administrator")) continue;
+            // banChatMember + unbanChatMember = "кик" (юзер может зайти заново).
+            await tg(env, "banChatMember", { chat_id: cid, user_id: uid });
+            try {
+              await tg(env, "unbanChatMember", { chat_id: cid, user_id: uid, only_if_banned: true });
+            } catch {}
+            kicked++;
+          } catch (err) {
+            const e = String(err);
+            if (kickErrors.length < 20) kickErrors.push({ user_id: uid, error: e });
+          }
+        }
       }
 
-      const wipe = body.wipe !== false; // по умолчанию чистим
+      if (doDelete) {
+        const msgs = await env.DB.prepare(
+          `SELECT message_id FROM chat_messages WHERE chat_id = ? ORDER BY message_id DESC LIMIT 5000`
+        ).bind(cid).all();
+        for (const m of msgs.results || []) {
+          const mid = Number(m.message_id);
+          if (!mid) continue;
+          try {
+            await tg(env, "deleteMessage", { chat_id: cid, message_id: mid });
+            deleted++;
+            // вычистим из локального кэша только то, что точно удалили в TG
+            try {
+              await env.DB.prepare(`DELETE FROM chat_messages WHERE chat_id = ? AND message_id = ?`)
+                .bind(cid, mid).run();
+            } catch {}
+          } catch (err) {
+            const e = String(err);
+            if (deleteErrors.length < 20) deleteErrors.push({ message_id: mid, error: e });
+          }
+        }
+      }
+
+      let leftOk = null, leftErr = null;
+      if (doLeave) {
+        try { await tg(env, "leaveChat", { chat_id: cid }); leftOk = true; }
+        catch (err) { leftOk = false; leftErr = String(err); }
+        try {
+          await env.DB.prepare(
+            `UPDATE chat_meta SET removed = 1, last_seen = ? WHERE chat_id = ?`
+          ).bind(nowTs(), cid).run();
+        } catch {}
+      }
+
+      return json({
+        ok: true,
+        kicked, kick_errors: kickErrors,
+        deleted, delete_errors: deleteErrors,
+        left: leftOk, leave_error: leftErr,
+      });
+    }
+
+    // POST /api/delete-chat — устаревший алиас на /api/purge-chat с also_leave=true
+    if (path === "/api/delete-chat" && request.method === "POST") {
+      const body = await request.json();
+      const cid  = String(body.chat_id || "");
+      if (!cid) return json({ error: "chat_id required" }, 400);
+      let leftOk = false, leftErr = null;
+      try { await tg(env, "leaveChat", { chat_id: cid }); leftOk = true; }
+      catch (err) { leftErr = String(err); }
+      const wipe = body.wipe !== false;
       let wiped = 0;
       if (wipe) {
         const tables = [
@@ -3010,11 +3122,9 @@ async function handleDashboardApi(request, env, url) {
           } catch {}
         }
       }
-
       await env.DB.prepare(
         `UPDATE chat_meta SET removed = 1, last_seen = ? WHERE chat_id = ?`
       ).bind(nowTs(), cid).run();
-
       return json({ ok: leftOk, left: leftOk, leave_error: leftErr, wiped, wipe });
     }
 
@@ -3480,18 +3590,22 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         </div>
 
         <div class="danger-card mt-20">
-          <div class="danger-title">⚠ Опасная зона — удалить чат</div>
+          <div class="danger-title">⚠ Опасная зона — зачистка чата</div>
           <div class="danger-desc">
             Бот <b>не может удалить сам чат</b> в Telegram (это ограничение Bot API).
-            Эта кнопка делает следующее:
+            Кнопка ниже делает следующее:
             <ul style="margin:8px 0 0 22px">
-              <li>Бот <b>выходит из чата</b> (<code>leaveChat</code>)</li>
-              <li>Удаляет <b>все данные чата</b> из базы D1: настройки, варны, лог, кэш, кланы, сообщения и т.д.</li>
+              <li>Кикнет <b>всех участников</b>, которых бот видел (через <code>banChatMember</code> + <code>unbanChatMember</code> — заходить смогут заново). Создателя и админов кикнуть нельзя.</li>
+              <li>Удалит <b>все сообщения</b>, которые бот видел и закэшировал (через <code>deleteMessage</code>). Историю до того как бот пришёл, стереть нельзя.</li>
+              <li>В каналах: «кик» = бан подписчика. Подписчиков бот видит только если они хоть раз писали (для бесед).</li>
             </ul>
           </div>
-          <label class="check-row"><input type="checkbox" id="confirm-delete"> Я понимаю и хочу удалить все данные чата.</label>
+          <label class="check-row"><input type="checkbox" id="purge-kick" checked> Кикнуть участников</label>
+          <label class="check-row"><input type="checkbox" id="purge-delmsgs" checked> Удалить сообщения</label>
+          <label class="check-row"><input type="checkbox" id="purge-leave"> Бот ещё и выйдет из чата</label>
+          <label class="check-row"><input type="checkbox" id="confirm-purge"> Я понимаю последствия и хочу провести зачистку.</label>
           <div class="row" style="justify-content:flex-end">
-            <button class="btn btn-danger" onclick="deleteChat()">Бот покидает чат и удаляет данные</button>
+            <button class="btn btn-danger" onclick="purgeChat()">🧨 Зачистить чат</button>
           </div>
         </div>
       </div>
@@ -3746,6 +3860,7 @@ function renderMsg(m, withTools) {
   const kind = m.kind && m.kind !== 'text' ? '<span class="msg-kind">[' + esc(m.kind) + ']</span>' : '';
   const tools = withTools
     ? '<div class="msg-tools">'
+      + '<button class="btn btn-sm" data-msg-act="edit">✏️ Редактировать</button>'
       + '<button class="btn btn-sm btn-danger" data-msg-act="delete">🗑 Удалить</button>'
       + '<button class="btn btn-sm" data-msg-act="pin">📌 Закрепить</button>'
       + '<button class="btn btn-sm" data-msg-act="ban">🔨 Бан автора</button>'
@@ -3767,7 +3882,8 @@ function wireFeedButtons(rootEl) {
     row.querySelectorAll('button[data-msg-act]').forEach(btn => {
       btn.addEventListener('click', () => {
         const a = btn.dataset.msgAct;
-        if (a === 'delete') deleteMsg(mid);
+        if (a === 'edit') editMsg(mid);
+        else if (a === 'delete') deleteMsg(mid);
         else if (a === 'pin') { document.getElementById('pin-id').value = mid; showTab('manage'); }
         else if (a === 'ban') banUser(uid, uname);
       });
@@ -4036,14 +4152,44 @@ async function unpinAll() {
   try { const r = await apiPost('/api/unpin', { chat_id: CHAT_ID }); r.ok ? showToast('Откреплено', 'success') : showToast(r.error || 'Ошибка', 'error'); }
   catch { showToast('Ошибка', 'error'); }
 }
-async function deleteChat() {
-  if (!document.getElementById('confirm-delete').checked) { showToast('Подтверди удаление чекбоксом', 'error'); return; }
-  if (!confirm('УДАЛИТЬ этот чат? Бот выйдет, все данные будут стёрты. Это действие нельзя отменить.')) return;
+async function purgeChat() {
+  if (!document.getElementById('confirm-purge').checked) { showToast('Подтверди зачистку чекбоксом', 'error'); return; }
+  const kick      = document.getElementById('purge-kick').checked;
+  const delMsgs   = document.getElementById('purge-delmsgs').checked;
+  const alsoLeave = document.getElementById('purge-leave').checked;
+  if (!kick && !delMsgs && !alsoLeave) { showToast('Нечего делать — отметь хотя бы одно действие', 'error'); return; }
+  const summary = [
+    kick      ? 'кикнуть всех известных участников' : null,
+    delMsgs   ? 'удалить все известные сообщения'    : null,
+    alsoLeave ? 'и бот выйдет из чата'              : null,
+  ].filter(Boolean).join(', ');
+  if (!confirm('ЗАЧИСТКА: ' + summary + '. Действие необратимо. Продолжить?')) return;
+  showToast('Зачистка идёт… это может занять минуту');
   try {
-    const r = await apiPost('/api/delete-chat', { chat_id: CHAT_ID, wipe: true });
-    showToast(r.left ? 'Бот вышел, удалено записей: ' + r.wiped : ('Бот не смог выйти: ' + (r.leave_error || '?') + '. Записей удалено: ' + r.wiped), r.left ? 'success' : 'error');
-    setTimeout(showChatPicker, 800);
-  } catch { showToast('Ошибка', 'error'); }
+    const r = await apiPost('/api/purge-chat', {
+      chat_id: CHAT_ID, kick, delete_messages: delMsgs, also_leave: alsoLeave,
+    });
+    const parts = [];
+    if (kick)      parts.push('кикнуто: ' + r.kicked + (r.kick_errors?.length ? ' (ошибок ' + r.kick_errors.length + ')' : ''));
+    if (delMsgs)   parts.push('удалено: ' + r.deleted + (r.delete_errors?.length ? ' (ошибок ' + r.delete_errors.length + ')' : ''));
+    if (alsoLeave) parts.push(r.left ? 'бот вышел' : 'бот не смог выйти');
+    showToast(parts.join(' · ') || 'Готово', 'success');
+    if (alsoLeave && r.left) setTimeout(showChatPicker, 1200);
+    else loadFeed(true);
+  } catch (e) { showToast('Ошибка зачистки: ' + String(e), 'error'); }
+}
+
+async function editMsg(mid) {
+  const cur = document.querySelector('.msg[data-mid="' + Number(mid) + '"] .msg-text');
+  const old = cur ? cur.textContent : '';
+  const next = prompt('Новый текст сообщения (бот должен быть автором или админом с правом редактирования):', old);
+  if (next === null) return;
+  if (!next.trim()) { showToast('Пусто — используй «Удалить»', 'error'); return; }
+  try {
+    const r = await apiPost('/api/edit-message', { chat_id: CHAT_ID, message_id: mid, text: next });
+    if (r.ok) { showToast('Отредактировано', 'success'); loadFeed(true); }
+    else showToast(r.error || 'Ошибка', 'error');
+  } catch (e) { showToast('Ошибка: ' + String(e), 'error'); }
 }
 </script>
 </body>

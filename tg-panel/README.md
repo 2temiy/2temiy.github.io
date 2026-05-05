@@ -98,9 +98,11 @@ node --check tg-panel/worker.js
 | POST | `/api/unmute` | размут `{chat_id,user_id}` |
 | POST | `/api/setrank` | выдать ранг `{chat_id,user_id,level}` (0-7) |
 | POST | `/api/edit-chat` | сменить название / описание `{chat_id,title?,description?}` |
+| POST | `/api/edit-message` | редактировать пост `{chat_id,message_id,text,parse_mode?}` (для каналов и групп; пробует `editMessageText`, fallback на `editMessageCaption` для медиа) |
 | POST | `/api/pin` | закрепить `{chat_id,message_id,silent?}` |
 | POST | `/api/unpin` | открепить `{chat_id,message_id?}` |
-| POST | `/api/delete-chat` | бот выходит + чистим D1 `{chat_id,wipe?}` |
+| POST | `/api/purge-chat` | зачистка `{chat_id,kick?,delete_messages?,also_leave?}` — кикнуть всех известных юзеров и/или удалить все известные сообщения; возвращает `{kicked,kick_errors[],deleted,delete_errors[]}` |
+| POST | `/api/delete-chat` | (deprecated) бот выходит + чистим D1 `{chat_id,wipe?}` — оставлено для обратной совместимости |
 
 ## Что бот должен иметь в чате
 
