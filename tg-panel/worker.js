@@ -68,10 +68,20 @@ export default {
         });
       }
 
+      // Auth chain: header > query > cookie. Header is preferred for JSON
+      // RPCs (dashboard sends X-Dashboard-Password). Cookie covers media
+      // URLs (<img src>/<video src>/<a href>) where browsers can't attach
+      // custom headers. Query string is kept for backwards compat (curl,
+      // README examples) but is the worst option for credential hygiene
+      // because it ends up in CDN/access logs.
+      const cookieHeader = request.headers.get("cookie") || "";
+      const cookieMatch  = cookieHeader.match(/(?:^|;\s*)dp=([^;]+)/);
+      const cookiePwd    = cookieMatch ? decodeURIComponent(cookieMatch[1]) : "";
       const pwd = (
         request.headers.get("x-dashboard-password") ??
         request.headers.get("x-admin-key") ??
         url.searchParams.get("pwd") ??
+        cookiePwd ??
         ""
       ).trim();
 
@@ -2748,7 +2758,47 @@ async function handleDashboardApi(request, env, url) {
     const chatId = url.searchParams.get("chat_id") || "";
 
     // GET /api/ping — проверка пароля
-    if (path === "/api/ping" && isGet) return json({ ok: true });
+    if (path === "/api/ping" && isGet) {
+      // Set-Cookie at this point so subsequent media URLs (<img>, <video>,
+      // <a href>) authenticate without needing ?pwd= in the URL. We re-read
+      // the password from the same auth chain that already passed the gate
+      // above. SameSite=Strict + HttpOnly + 12h max-age — covers a typical
+      // moderation session without leaving long-lived creds in the browser.
+      const cookieHeader = request.headers.get("cookie") || "";
+      const cookieMatch  = cookieHeader.match(/(?:^|;\s*)dp=([^;]+)/);
+      const cookiePwd    = cookieMatch ? decodeURIComponent(cookieMatch[1]) : "";
+      const pwdToSet = (
+        request.headers.get("x-dashboard-password")
+        ?? request.headers.get("x-admin-key")
+        ?? url.searchParams.get("pwd")
+        ?? cookiePwd
+        ?? ""
+      ).trim();
+      const isHttps = url.protocol === "https:";
+      const setCookie = "dp=" + encodeURIComponent(pwdToSet)
+        + "; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict"
+        + (isHttps ? "; Secure" : "");
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "access-control-allow-origin": "*",
+          "set-cookie": setCookie,
+        },
+      });
+    }
+
+    // POST /api/logout — стереть auth-cookie (browser-side тоже forget pwd).
+    if (path === "/api/logout" && method === "POST") {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "access-control-allow-origin": "*",
+          "set-cookie": "dp=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",
+        },
+      });
+    }
 
     // GET /api/bot-info
     if (path === "/api/bot-info" && isGet) {
@@ -4346,6 +4396,10 @@ function enterApp() {
   showChatPicker();
 }
 function logout() {
+  // Сначала просим воркер стереть cookie, потом чистим локальное состояние.
+  // POST идёт с уже установленным cookie/header — после успешного ответа
+  // cookie исчезнет и в браузере, и для будущих запросов.
+  try { apiFetch('/api/logout', 'POST', {}).catch(() => {}); } catch {}
   PASSWORD = ''; CHAT_ID = ''; CURRENT_CHAT = null;
   if (FEED_TIMER) { clearInterval(FEED_TIMER); FEED_TIMER = null; }
   try { sessionStorage.removeItem('botpwd'); } catch {}
@@ -4362,10 +4416,15 @@ try {
 } catch {}
 
 // ── API ──────────────────────────────────────────────────────────
+// Пароль кладём в X-Dashboard-Password и в auth-cookie, не в URL.
+// До /api/ping не кладём — браузер сам пришлёт cookie из предыдущей сессии.
+// credentials:'same-origin' нужно чтобы Set-Cookie от воркера сохранился и
+// чтобы media-URL'ы (<img src=/api/file...>) автоматически отдавали cookie.
 async function apiFetch(path, method = 'GET', body = null) {
-  const sep = path.includes('?') ? '&' : '?';
-  const url = API + path + sep + 'pwd=' + encodeURIComponent(PASSWORD);
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  const url = API + path;
+  const headers = { 'Content-Type': 'application/json' };
+  if (PASSWORD) headers['X-Dashboard-Password'] = PASSWORD;
+  const opts = { method, headers, credentials: 'same-origin' };
   if (body) opts.body = JSON.stringify(body);
   return fetch(url, opts);
 }
@@ -4714,8 +4773,18 @@ async function sendReplyToMsg(mid, text, rowEl) {
     const r = await apiPost('/api/send-message', { chat_id: CHAT_ID, text: t, reply_to: mid });
     if (r.ok) {
       showToast('Отправлено', 'success');
-      if (rowEl) rowEl.style.display = 'none';
-      loadFeed(true);
+      // Закрываем reply-row, схлопываем родительское .msg.expanded и
+      // делаем force-refresh — иначе guard «expanded || typing» в
+      // loadFeed увидит расширенное родительское сообщение и пропустит
+      // рендер, и юзер не увидит свой только что отправленный ответ.
+      if (rowEl) {
+        rowEl.style.display = 'none';
+        const reply = rowEl.querySelector('[data-reply-input]');
+        if (reply) reply.value = '';
+        const parent = rowEl.closest('.msg');
+        if (parent) parent.classList.remove('expanded');
+      }
+      loadFeed('force');
     } else {
       showToast('Ошибка: ' + (r.error || 'unknown'), 'error');
     }
@@ -4752,20 +4821,43 @@ function muteUserPickDuration(uid, uname) {
   if (isNaN(min) || min < 0) { showToast('Некорректное число', 'error'); return; }
   muteUserFor(uid, uname, min * 60);
 }
+// silent=true   — фоновый авто-рефреш каждые 4с; пропускаем рендер если
+//                 юзер занят (печатает, слушает, открыл меню).
+// silent='force' — явное действие (delete/edit/send), всегда рендерим.
+// silent=false   — клик «Обновить»; рендерим со спиннером.
 async function loadFeed(silent) {
   const el = document.getElementById('feed');
+  const force = silent === 'force';
   if (!silent) el.innerHTML = '<div class="empty-state small">Загрузка…</div>';
   try {
     const d = await apiGet('/api/messages?chat_id=' + CHAT_ID + '&limit=80');
-    document.getElementById('feed-meta').textContent = (d.messages || []).length + ' сообщений';
-    if (!d.messages?.length) { el.innerHTML = '<div class="empty-state small">Сообщений нет</div>'; return; }
-    el.innerHTML = d.messages.map(m => renderMsg(m, true)).join('');
+    const list = d.messages || [];
+    document.getElementById('feed-meta').textContent = list.length + ' сообщений';
+
+    // На silent-обновлении НЕ перетираем DOM, если юзер прямо сейчас
+    // взаимодействует с лентой: раскрыл меню действий, печатает ответ,
+    // слушает войс/смотрит видео или просто держит фокус в инпуте.
+    // Иначе авто-рефреш каждые 4с убил бы вводимый текст и схлопнул
+    // открытые toolbar'ы. Вернёмся к рендеру при следующем тике.
+    if (silent === true) {
+      const expanded = el.querySelector('.msg.expanded');
+      const typing   = Array.from(el.querySelectorAll('[data-reply-input]'))
+                        .some(i => i.value && i.value.trim().length);
+      const playing  = Array.from(el.querySelectorAll('video, audio'))
+                        .some(m => !m.paused && !m.ended);
+      const focused  = el.contains(document.activeElement) && document.activeElement !== el;
+      if (expanded || typing || playing || focused) return;
+    }
+
+    if (!list.length) { el.innerHTML = '<div class="empty-state small">Сообщений нет</div>'; return; }
+    el.innerHTML = list.map(m => renderMsg(m, true)).join('');
     wireFeedButtons(el);
+    void force; // (явные рефреши проходят без skip-логики, флаг используется как маркер)
   } catch (e) { if (!silent) el.innerHTML = '<div class="empty-state small">Ошибка: ' + esc(String(e)) + '</div>'; }
 }
 async function deleteMsg(mid) {
   if (!confirm('Удалить сообщение в чате? (через Bot API)')) return;
-  try { const r = await apiPost('/api/delete-message', { chat_id: CHAT_ID, message_id: mid }); if (r.ok) { showToast('Удалено', 'success'); loadFeed(true); } else showToast(r.error || 'Ошибка', 'error'); }
+  try { const r = await apiPost('/api/delete-message', { chat_id: CHAT_ID, message_id: mid }); if (r.ok) { showToast('Удалено', 'success'); loadFeed('force'); } else showToast(r.error || 'Ошибка', 'error'); }
   catch { showToast('Ошибка', 'error'); }
 }
 
@@ -5150,7 +5242,7 @@ async function purgeChat() {
     if (alsoLeave) parts.push(r.left ? 'бот вышел' : 'бот не смог выйти');
     showToast(parts.join(' · ') || 'Готово', 'success');
     if (alsoLeave && r.left) setTimeout(showChatPicker, 1200);
-    else loadFeed(true);
+    else loadFeed('force');
   } catch (e) { showToast('Ошибка зачистки: ' + String(e), 'error'); }
 }
 
@@ -5162,7 +5254,7 @@ async function editMsg(mid) {
   if (!next.trim()) { showToast('Пусто — используй «Удалить»', 'error'); return; }
   try {
     const r = await apiPost('/api/edit-message', { chat_id: CHAT_ID, message_id: mid, text: next });
-    if (r.ok) { showToast('Отредактировано', 'success'); loadFeed(true); }
+    if (r.ok) { showToast('Отредактировано', 'success'); loadFeed('force'); }
     else showToast(r.error || 'Ошибка', 'error');
   } catch (e) { showToast('Ошибка: ' + String(e), 'error'); }
 }
