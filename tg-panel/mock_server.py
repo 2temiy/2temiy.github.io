@@ -22,12 +22,18 @@ START_TS = int(time.time())
 
 STATE = {
     "messages": [
-        {"message_id": 101, "user_id": "1001", "user_name": "Alice", "text": "Привет всем!", "kind": "text", "ts": START_TS - 600},
-        {"message_id": 102, "user_id": "1002", "user_name": "Bob", "text": "Йо", "kind": "text", "ts": START_TS - 500},
-        {"message_id": 103, "user_id": "1003", "user_name": "Charlie", "text": "Кто хочет CS-сервер сегодня?", "kind": "text", "ts": START_TS - 400},
-        {"message_id": 104, "user_id": "1001", "user_name": "Alice", "text": "Я в деле", "kind": "text", "ts": START_TS - 300},
+        {"message_id": 101, "user_id": "1001", "user_name": "Alice", "text": "Привет всем!", "kind": "text", "ts": START_TS - 600, "media": None, "reply_to": 0},
+        {"message_id": 102, "user_id": "1002", "user_name": "Bob", "text": "Йо", "kind": "text", "ts": START_TS - 500, "media": None, "reply_to": 101},
+        {"message_id": 103, "user_id": "1003", "user_name": "Charlie", "text": "Кто хочет CS-сервер сегодня?", "kind": "text", "ts": START_TS - 400, "media": None, "reply_to": 0},
+        {"message_id": 104, "user_id": "1001", "user_name": "Alice", "text": "Я в деле", "kind": "text", "ts": START_TS - 300, "media": None, "reply_to": 103},
+        {"message_id": 105, "user_id": "1002", "user_name": "Bob", "text": "", "kind": "photo", "ts": START_TS - 250,
+         "media": {"kind": "photo", "file_id": "MOCK_FILE_PHOTO", "w": 800, "h": 600}, "reply_to": 0},
+        {"message_id": 106, "user_id": "1003", "user_name": "Charlie", "text": "", "kind": "sticker", "ts": START_TS - 200,
+         "media": {"kind": "sticker", "file_id": "MOCK_FILE_STICKER", "w": 512, "h": 512, "is_animated": False, "is_video": False, "emoji": "🔥", "thumb_file_id": "MOCK_FILE_STICKER_T"}, "reply_to": 0},
+        {"message_id": 107, "user_id": "1001", "user_name": "Alice", "text": "посмотри", "kind": "document", "ts": START_TS - 100,
+         "media": {"kind": "document", "file_id": "MOCK_FILE_DOC", "mime": "application/pdf", "name": "report.pdf", "size": 184320}, "reply_to": 0},
     ],
-    "next_msg_id": 105,
+    "next_msg_id": 200,
     "extra_msg_ts": 0,
     "post_logout_msg_calls": 0,
     "logout_at_ts": 0,
@@ -243,6 +249,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"no avatar")
+            return
+
+        if path == "/api/file":
+            # Мок отдаёт пустые байты с правильным content-type, чтобы дашборд
+            # рендерил <img>/<video>/<audio> заглушки и не падал на сетевых
+            # ошибках. Реального содержимого тут не нужно — это standalone-тест.
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            # 1×1 transparent PNG so <img> doesn't trigger onerror in tests.
+            self.wfile.write(bytes.fromhex(
+                "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da6300010000000500000d0a2db40000000049454e44ae426082"
+            ))
             return
 
         if path == "/api/user-info":

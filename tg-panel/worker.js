@@ -2134,11 +2134,105 @@ async function upsertChatMeta(env, chat) {
   } catch {}
 }
 
+// Compact descriptor of message media for the dashboard. Stored as JSON in
+// chat_messages.media so /api/messages can return it without re-parsing the
+// full update. Only the largest photo size is kept (Telegram returns several).
+function extractMedia(msg) {
+  if (msg.photo && msg.photo.length) {
+    const big = msg.photo[msg.photo.length - 1];
+    return {
+      kind: "photo",
+      file_id: big.file_id || "",
+      w: big.width || 0,
+      h: big.height || 0,
+    };
+  }
+  if (msg.sticker) {
+    const s = msg.sticker;
+    return {
+      kind: "sticker",
+      file_id: s.file_id || "",
+      w: s.width || 0,
+      h: s.height || 0,
+      is_animated: !!s.is_animated,
+      is_video:    !!s.is_video,
+      emoji:       s.emoji || "",
+      thumb_file_id: s.thumb?.file_id || s.thumbnail?.file_id || "",
+    };
+  }
+  if (msg.video) {
+    const v = msg.video;
+    return {
+      kind: "video",
+      file_id: v.file_id || "",
+      w: v.width || 0, h: v.height || 0,
+      duration: v.duration || 0,
+      mime: v.mime_type || "",
+      name: v.file_name || "",
+      thumb_file_id: v.thumb?.file_id || v.thumbnail?.file_id || "",
+    };
+  }
+  if (msg.video_note) {
+    const v = msg.video_note;
+    return {
+      kind: "video_note",
+      file_id: v.file_id || "",
+      duration: v.duration || 0,
+      thumb_file_id: v.thumb?.file_id || v.thumbnail?.file_id || "",
+    };
+  }
+  if (msg.animation) {
+    const a = msg.animation;
+    return {
+      kind: "animation",
+      file_id: a.file_id || "",
+      w: a.width || 0, h: a.height || 0,
+      duration: a.duration || 0,
+      mime: a.mime_type || "",
+      name: a.file_name || "",
+      thumb_file_id: a.thumb?.file_id || a.thumbnail?.file_id || "",
+    };
+  }
+  if (msg.voice) {
+    return { kind: "voice", file_id: msg.voice.file_id || "", duration: msg.voice.duration || 0, mime: msg.voice.mime_type || "" };
+  }
+  if (msg.audio) {
+    const a = msg.audio;
+    return {
+      kind: "audio",
+      file_id: a.file_id || "",
+      duration: a.duration || 0,
+      mime: a.mime_type || "",
+      name: a.file_name || a.title || "",
+      performer: a.performer || "",
+    };
+  }
+  if (msg.document) {
+    const d = msg.document;
+    return {
+      kind: "document",
+      file_id: d.file_id || "",
+      mime: d.mime_type || "",
+      name: d.file_name || "",
+      size: d.file_size || 0,
+      thumb_file_id: d.thumb?.file_id || d.thumbnail?.file_id || "",
+    };
+  }
+  if (msg.poll) {
+    return { kind: "poll", question: String(msg.poll.question || "").slice(0, 200) };
+  }
+  if (msg.location) {
+    return { kind: "location", lat: msg.location.latitude, lng: msg.location.longitude };
+  }
+  return {};
+}
+
 async function logMessage(db, chatId, msg) {
   try {
     let kind = "text";
     if (msg.photo) kind = "photo";
     else if (msg.video) kind = "video";
+    else if (msg.video_note) kind = "video_note";
     else if (msg.voice) kind = "voice";
     else if (msg.audio) kind = "audio";
     else if (msg.document) kind = "document";
@@ -2151,11 +2245,13 @@ async function logMessage(db, chatId, msg) {
     const text    = rawText.length > 4000 ? rawText.slice(0, 4000) : rawText;
     const userId  = String(msg.from?.id || "0");
     const userName = msg.from ? getUserName(msg.from) : "";
+    const media   = JSON.stringify(extractMedia(msg));
+    const replyTo = Number(msg.reply_to_message?.message_id || 0);
 
     await db.prepare(
-      `INSERT INTO chat_messages (chat_id, message_id, user_id, user_name, text, kind, ts)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).bind(chatId, msg.message_id || 0, userId, userName, text, kind, msg.date || nowTs()).run();
+      `INSERT INTO chat_messages (chat_id, message_id, user_id, user_name, text, kind, ts, media, reply_to)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(chatId, msg.message_id || 0, userId, userName, text, kind, msg.date || nowTs(), media, replyTo).run();
 
     // Trim per-chat to last 1000 messages to keep D1 small
     await db.prepare(
@@ -2585,7 +2681,9 @@ async function ensureSchema(db) {
       user_name   TEXT    NOT NULL DEFAULT '',
       text        TEXT    NOT NULL DEFAULT '',
       kind        TEXT    NOT NULL DEFAULT 'text',
-      ts          INTEGER NOT NULL DEFAULT 0
+      ts          INTEGER NOT NULL DEFAULT 0,
+      media       TEXT    NOT NULL DEFAULT '',
+      reply_to    INTEGER NOT NULL DEFAULT 0
     )`,
     `CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id, ts DESC)`,
 
@@ -2626,6 +2724,8 @@ async function ensureSchema(db) {
     `ALTER TABLE user_cache ADD COLUMN avatar_fetched_at INTEGER NOT NULL DEFAULT 0`,
     `ALTER TABLE user_cache ADD COLUMN status TEXT DEFAULT ''`,
     `ALTER TABLE user_cache ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE chat_messages ADD COLUMN media TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE chat_messages ADD COLUMN reply_to INTEGER NOT NULL DEFAULT 0`,
   ];
   for (const m of migrations) {
     try { await db.prepare(m).run(); } catch {}
@@ -2876,16 +2976,34 @@ async function handleDashboardApi(request, env, url) {
     if (path === "/api/messages" && chatId && isGet) {
       const limit  = Math.max(1, Math.min(200, Number(url.searchParams.get("limit")) || 50));
       const before = Number(url.searchParams.get("before_id")) || 0;
+      const cols = `id, message_id, user_id, user_name, text, kind, ts, media, reply_to`;
       const rows = before
         ? await env.DB.prepare(
-            `SELECT id, message_id, user_id, user_name, text, kind, ts FROM chat_messages
+            `SELECT ${cols} FROM chat_messages
              WHERE chat_id = ? AND id < ? ORDER BY id DESC LIMIT ?`
           ).bind(chatId, before, limit).all()
         : await env.DB.prepare(
-            `SELECT id, message_id, user_id, user_name, text, kind, ts FROM chat_messages
+            `SELECT ${cols} FROM chat_messages
              WHERE chat_id = ? ORDER BY id DESC LIMIT ?`
           ).bind(chatId, limit).all();
-      return json({ messages: rows.results || [] });
+      const messages = (rows.results || []).map(r => {
+        let media = null;
+        if (r.media) {
+          try { media = JSON.parse(r.media); } catch { media = null; }
+        }
+        return {
+          id: r.id,
+          message_id: r.message_id,
+          user_id: r.user_id,
+          user_name: r.user_name,
+          text: r.text,
+          kind: r.kind,
+          ts: r.ts,
+          media: media && Object.keys(media).length ? media : null,
+          reply_to: r.reply_to || 0,
+        };
+      });
+      return json({ messages });
     }
 
     // POST /api/send-message { chat_id, text, reply_to? }
@@ -3006,6 +3124,51 @@ async function handleDashboardApi(request, env, url) {
         headers: {
           "content-type": upstream.headers.get("content-type") || "image/jpeg",
           "cache-control": "public, max-age=86400",
+          "access-control-allow-origin": "*",
+        },
+      });
+    }
+
+    // GET /api/file?chat_id=&message_id=&which=main|thumb — прокси через
+    // Bot API getFile + raw upstream. Берём file_id из chat_messages.media.
+    // BOT_TOKEN не светим в URL для дашборда. Cache-control короткий, потому
+    // что file_path в Telegram может протухать.
+    if (path === "/api/file" && isGet && chatId) {
+      const mid   = Number(url.searchParams.get("message_id") || 0);
+      const which = url.searchParams.get("which") || "main";
+      if (!mid) return new Response("message_id required", { status: 400 });
+      const row = await env.DB.prepare(
+        `SELECT media FROM chat_messages WHERE chat_id = ? AND message_id = ?`
+      ).bind(chatId, mid).first();
+      let media = null;
+      try { media = row?.media ? JSON.parse(row.media) : null; } catch {}
+      if (!media) return new Response("no media", { status: 404 });
+      const fileId = which === "thumb"
+        ? (media.thumb_file_id || media.file_id || "")
+        : (media.file_id || "");
+      if (!fileId) return new Response("no file_id", { status: 404 });
+      let f;
+      try { f = await tg(env, "getFile", { file_id: fileId }); }
+      catch { return new Response("getFile failed", { status: 502 }); }
+      const filePath = f?.file_path || "";
+      if (!filePath) return new Response("no file_path", { status: 404 });
+      const tgUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`;
+      const upstream = await fetch(tgUrl);
+      if (!upstream.ok) return new Response("upstream " + upstream.status, { status: 502 });
+      const ct = upstream.headers.get("content-type")
+        || (media.kind === "photo"     ? "image/jpeg"
+        :   media.kind === "sticker"   ? "image/webp"
+        :   media.kind === "video"     ? "video/mp4"
+        :   media.kind === "animation" ? "video/mp4"
+        :   media.kind === "voice"     ? "audio/ogg"
+        :   media.kind === "audio"     ? "audio/mpeg"
+        :   "application/octet-stream");
+      return new Response(upstream.body, {
+        status: 200,
+        headers: {
+          "content-type": ct,
+          // короткий кэш: file_path в Telegram бывает протухает за часы
+          "cache-control": "private, max-age=600",
           "access-control-allow-origin": "*",
         },
       });
@@ -3712,15 +3875,33 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .num-val{min-width:32px;text-align:center;font-weight:700}
 
   /* feed */
-  .feed{display:flex;flex-direction:column;gap:8px;max-height:520px;overflow-y:auto;padding-right:6px}
-  .msg{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:4px;animation:fadeUp .25s ease both}
+  .feed{display:flex;flex-direction:column;gap:8px;max-height:620px;overflow-y:auto;padding-right:6px}
+  .msg{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:6px;animation:fadeUp .25s ease both;cursor:pointer;transition:border-color .15s,background .15s}
+  .msg:hover{border-color:var(--border-h);background:#192034}
+  .msg.expanded{border-color:var(--accent)}
   .msg-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px}
   .msg-author{color:var(--accent);font-weight:700}
   .msg-time{color:var(--muted)}
+  .msg-id{color:var(--muted2);font-size:11px;font-family:'Russo One',sans-serif}
+  .msg-reply{font-size:12px;color:var(--muted);border-left:2px solid var(--accent);padding-left:8px;margin-bottom:2px;opacity:.7}
   .msg-text{font-size:14px;color:var(--text);white-space:pre-wrap;word-break:break-word}
   .msg-kind{font-size:11px;color:var(--muted2);font-style:italic}
   .msg-actions{display:flex;gap:6px;align-items:center}
-  .msg-tools{margin-top:4px;display:flex;gap:6px;flex-wrap:wrap}
+  .msg-tools{margin-top:4px;display:none;gap:6px;flex-wrap:wrap;border-top:1px solid var(--border);padding-top:8px}
+  .msg.expanded .msg-tools{display:flex}
+  .msg-attach{display:flex;flex-direction:column;gap:6px;margin-top:4px}
+  .attach-img{max-width:280px;max-height:280px;border-radius:10px;background:var(--bg);object-fit:cover;display:block;cursor:zoom-in}
+  .attach-sticker{max-width:160px;max-height:160px;display:block}
+  .attach-video{max-width:340px;max-height:340px;border-radius:10px;display:block;background:#000}
+  .attach-audio{max-width:340px;display:block}
+  .attach-doc{display:flex;align-items:center;gap:10px;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:10px 12px;max-width:340px;text-decoration:none;color:var(--text)}
+  .attach-doc:hover{border-color:var(--accent)}
+  .attach-doc .doc-icon{font-size:28px;line-height:1;flex-shrink:0}
+  .attach-doc .doc-meta{min-width:0;flex:1}
+  .attach-doc .doc-name{font-weight:600;word-break:break-word;font-size:13px}
+  .attach-doc .doc-size{font-size:11px;color:var(--muted)}
+  .reply-input-row{display:flex;gap:6px;width:100%;margin-top:6px}
+  .reply-input-row .input{flex:1}
 
   /* danger zone */
   .danger-card{background:linear-gradient(135deg,rgba(255,59,92,.08),transparent);border:1px solid rgba(255,59,92,.4);border-radius:14px;padding:24px}
@@ -4356,39 +4537,203 @@ async function loadChatInfo() {
 }
 
 // ── FEED ─────────────────────────────────────────────────────────
+// Превью вложения. Все file_id мы держим на бэке — фронт ходит только
+// через /api/file?chat_id=&message_id=&which=main|thumb прокси, который
+// не светит BOT_TOKEN. Анимированные стикеры (.tgs lottie) браузер не
+// тянет — для них рендерим thumb (webp) с эмодзи под ним.
+function renderAttachment(m) {
+  const a = m.media; if (!a || !a.kind) return '';
+  const fileUrl = (which) => '/api/file?chat_id=' + encodeURIComponent(CHAT_ID)
+    + '&message_id=' + Number(m.message_id)
+    + (which === 'thumb' ? '&which=thumb' : '');
+  const k = a.kind;
+  if (k === 'photo') {
+    return '<div class="msg-attach"><img class="attach-img" src="' + esc(fileUrl('main')) + '" alt="photo" loading="lazy" data-zoom="1"></div>';
+  }
+  if (k === 'sticker') {
+    // .tgs (animated) и .webm (video) — браузер не покажет webp/img корректно;
+    // для них берём thumb. Обычные webp-стикеры тянем напрямую.
+    const useThumb = a.is_animated || a.is_video;
+    const src = fileUrl(useThumb ? 'thumb' : 'main');
+    const emoji = a.emoji ? ' <span class="msg-kind">' + esc(a.emoji) + '</span>' : '';
+    return '<div class="msg-attach"><img class="attach-sticker" src="' + esc(src) + '" alt="sticker" loading="lazy">'
+      + (a.is_animated ? '<span class="msg-kind">[анимированный стикер]' + emoji + '</span>' : (a.is_video ? '<span class="msg-kind">[видео-стикер]' + emoji + '</span>' : emoji))
+      + '</div>';
+  }
+  if (k === 'video' || k === 'animation' || k === 'video_note') {
+    const dur = a.duration ? ' · ' + a.duration + 's' : '';
+    const wh  = (a.w && a.h) ? ' · ' + a.w + '×' + a.h : '';
+    return '<div class="msg-attach">'
+      + '<video class="attach-video" controls preload="metadata" src="' + esc(fileUrl('main')) + '"></video>'
+      + '<span class="msg-kind">[' + esc(k) + dur + wh + ']</span>'
+      + '</div>';
+  }
+  if (k === 'voice' || k === 'audio') {
+    const dur = a.duration ? a.duration + 's' : '';
+    const meta = a.performer ? esc(a.performer) + (a.name ? ' — ' + esc(a.name) : '') : esc(a.name || '');
+    return '<div class="msg-attach">'
+      + '<audio class="attach-audio" controls preload="metadata" src="' + esc(fileUrl('main')) + '"></audio>'
+      + '<span class="msg-kind">[' + esc(k) + (dur ? ' · ' + dur : '') + (meta ? ' · ' + meta : '') + ']</span>'
+      + '</div>';
+  }
+  if (k === 'document') {
+    const sz = a.size ? ' · ' + Math.round(a.size / 1024) + ' KB' : '';
+    const mime = a.mime ? ' · ' + esc(a.mime) : '';
+    return '<div class="msg-attach"><a class="attach-doc" href="' + esc(fileUrl('main'))
+      + '" target="_blank" rel="noopener" download>'
+      + '<div class="doc-icon">📎</div>'
+      + '<div class="doc-meta"><div class="doc-name">' + esc(a.name || 'файл') + '</div>'
+      + '<div class="doc-size">' + esc(k) + sz + mime + '</div></div>'
+      + '</a></div>';
+  }
+  if (k === 'poll') {
+    return '<div class="msg-attach"><span class="msg-kind">📊 Опрос:</span> ' + esc(a.question || '') + '</div>';
+  }
+  if (k === 'location') {
+    return '<div class="msg-attach"><span class="msg-kind">📍 Локация:</span> '
+      + esc(String(a.lat || '')) + ', ' + esc(String(a.lng || '')) + '</div>';
+  }
+  return '';
+}
+
 function renderMsg(m, withTools) {
-  const kind = m.kind && m.kind !== 'text' ? '<span class="msg-kind">[' + esc(m.kind) + ']</span>' : '';
+  const uname = esc(m.user_name || 'user_' + m.user_id);
+  const replyHtml = m.reply_to
+    ? '<div class="msg-reply">↩ ответ на #' + Number(m.reply_to) + '</div>' : '';
+  const kindBadge = m.kind && m.kind !== 'text'
+    ? ' <span class="msg-kind">[' + esc(m.kind) + ']</span>' : '';
+  const attach = renderAttachment(m);
+  // Action toolbar — теперь полный набор: ответить-как-бот, удалить, мут (с
+  // выбором длительности), бан, кик. Раскрывается по клику на сообщение.
   const tools = withTools
-    ? '<div class="msg-tools">'
-      + '<button class="btn btn-sm" data-msg-act="edit">✏️ Редактировать</button>'
+    ? '<div class="msg-tools" data-tools>'
+      + '<button class="btn btn-sm" data-msg-act="reply">↩️ Ответить от бота</button>'
       + '<button class="btn btn-sm btn-danger" data-msg-act="delete">🗑 Удалить</button>'
+      + '<button class="btn btn-sm" data-msg-act="mute1h">🔇 Мут 1ч</button>'
+      + '<button class="btn btn-sm" data-msg-act="muteN">⏲ Мут на…</button>'
+      + '<button class="btn btn-sm btn-danger" data-msg-act="ban">🔨 Бан</button>'
+      + '<button class="btn btn-sm" data-msg-act="kick">👢 Кик</button>'
+      + '<button class="btn btn-sm" data-msg-act="edit">✏️ Редактировать</button>'
       + '<button class="btn btn-sm" data-msg-act="pin">📌 Закрепить</button>'
-      + '<button class="btn btn-sm" data-msg-act="ban">🔨 Бан автора</button>'
+      + '<button class="btn btn-sm btn-ghost" data-msg-act="profile">👤 Профиль</button>'
+      + '<div class="reply-input-row" data-reply-row style="display:none">'
+      +   '<input class="input" data-reply-input placeholder="Ответ от имени бота…">'
+      +   '<button class="btn btn-accent btn-sm" data-msg-act="reply-send">Отправить →</button>'
+      +   '<button class="btn btn-sm btn-ghost" data-msg-act="reply-cancel">×</button>'
+      + '</div>'
       + '</div>'
     : '';
-  const uname = esc(m.user_name || 'user_' + m.user_id);
   return '<div class="msg" data-mid="' + Number(m.message_id) + '" data-uid="' + esc(m.user_id) + '" data-uname="' + uname + '">'
-    + '<div class="msg-head"><span class="msg-author">' + uname + '</span><span class="msg-time">' + esc(fmtTime(m.ts)) + '</span></div>'
-    + (m.text ? '<div class="msg-text">' + esc(m.text) + '</div>' : '<div class="msg-text muted">(без текста)</div>')
-    + (kind ? '<div>' + kind + '</div>' : '')
+    + '<div class="msg-head"><span class="msg-author">' + uname + '</span>'
+    +   '<span class="msg-time">' + esc(fmtTime(m.ts)) + ' · #' + Number(m.message_id) + '</span></div>'
+    + replyHtml
+    + (m.text ? '<div class="msg-text">' + esc(m.text) + kindBadge + '</div>'
+              : (attach ? '' : '<div class="msg-text muted">(без текста)' + kindBadge + '</div>'))
+    + attach
     + tools
     + '</div>';
 }
+
 function wireFeedButtons(rootEl) {
   rootEl.querySelectorAll('.msg[data-mid]').forEach(row => {
-    const mid = Number(row.dataset.mid);
-    const uid = row.dataset.uid;
+    const mid   = Number(row.dataset.mid);
+    const uid   = row.dataset.uid;
     const uname = row.dataset.uname;
+
+    // Клик на сам блок сообщения раскрывает/сворачивает действия.
+    // Кнопки внутри toolbar и плеер/превью обрабатывают свои клики
+    // через stopPropagation.
+    row.addEventListener('click', e => {
+      if (e.target.closest('button, a, video, audio, input')) return;
+      // image zoom: клик на attach-img (data-zoom=1) открывает в новой вкладке.
+      if (e.target.matches('img.attach-img[data-zoom="1"]')) {
+        window.open(e.target.src, '_blank', 'noopener');
+        return;
+      }
+      row.classList.toggle('expanded');
+    });
+
     row.querySelectorAll('button[data-msg-act]').forEach(btn => {
-      btn.addEventListener('click', () => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
         const a = btn.dataset.msgAct;
-        if (a === 'edit') editMsg(mid);
-        else if (a === 'delete') deleteMsg(mid);
-        else if (a === 'pin') { document.getElementById('pin-id').value = mid; showTab('manage'); }
-        else if (a === 'ban') banUser(uid, uname);
+        const replyRow = row.querySelector('[data-reply-row]');
+        const replyInp = row.querySelector('[data-reply-input]');
+        if (a === 'reply') {
+          replyRow.style.display = 'flex';
+          replyInp.value = '';
+          setTimeout(() => replyInp.focus(), 0);
+        }
+        else if (a === 'reply-cancel') { replyRow.style.display = 'none'; }
+        else if (a === 'reply-send')   { sendReplyToMsg(mid, replyInp.value, replyRow); }
+        else if (a === 'delete')   deleteMsg(mid);
+        else if (a === 'mute1h')   muteUserFor(uid, uname, 3600);
+        else if (a === 'muteN')    muteUserPickDuration(uid, uname);
+        else if (a === 'ban')      banUser(uid, uname);
+        else if (a === 'kick')     kickUser(uid, uname);
+        else if (a === 'edit')     editMsg(mid);
+        else if (a === 'pin')      { document.getElementById('pin-id').value = mid; showTab('manage'); }
+        else if (a === 'profile')  openUserModal(uid);
       });
     });
+
+    // Enter в инпуте ответа = отправить.
+    const inp = row.querySelector('[data-reply-input]');
+    inp?.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault(); e.stopPropagation();
+        sendReplyToMsg(mid, inp.value, row.querySelector('[data-reply-row]'));
+      }
+    });
   });
+}
+
+// Отправить сообщение от имени бота как ответ на конкретный msg.
+async function sendReplyToMsg(mid, text, rowEl) {
+  const t = String(text || '').trim();
+  if (!t) { showToast('Пустой ответ', 'error'); return; }
+  showToast('Отправляю…');
+  try {
+    const r = await apiPost('/api/send-message', { chat_id: CHAT_ID, text: t, reply_to: mid });
+    if (r.ok) {
+      showToast('Отправлено', 'success');
+      if (rowEl) rowEl.style.display = 'none';
+      loadFeed(true);
+    } else {
+      showToast('Ошибка: ' + (r.error || 'unknown'), 'error');
+    }
+  } catch (e) { showToast('Ошибка: ' + String(e), 'error'); }
+}
+
+// Мут на указанный срок в секундах. Для удобства: 0 = пермамут.
+async function muteUserFor(uid, uname, seconds) {
+  if (!confirm('Замутить ' + uname + ' на ' + (seconds ? seconds + ' сек' : 'НАВСЕГДА') + '?')) return;
+  showToast('Мут…');
+  try {
+    const r = await apiPost('/api/mute', { chat_id: CHAT_ID, user_id: uid, duration_sec: seconds || 0 });
+    if (r.ok) showToast('Замутили ' + uname, 'success');
+    else      showToast('Ошибка: ' + (r.error || 'unknown'), 'error');
+  } catch (e) { showToast('Ошибка: ' + String(e), 'error'); }
+}
+
+// Выбор длительности мута через простое меню (prompt с пресетами).
+function muteUserPickDuration(uid, uname) {
+  const choice = prompt(
+    'Длительность мута для ' + uname + ':\\n'
+    + '  5  — 5 минут\\n'
+    + '  15 — 15 минут\\n'
+    + '  60 — 1 час\\n'
+    + '  360 — 6 часов\\n'
+    + '  1440 — 24 часа\\n'
+    + '  10080 — 7 дней\\n'
+    + '  0  — НАВСЕГДА\\n'
+    + '(введи число минут или своё значение)',
+    '60'
+  );
+  if (choice === null) return;
+  const min = Number(choice);
+  if (isNaN(min) || min < 0) { showToast('Некорректное число', 'error'); return; }
+  muteUserFor(uid, uname, min * 60);
 }
 async function loadFeed(silent) {
   const el = document.getElementById('feed');
