@@ -148,6 +148,17 @@ class Handler(BaseHTTPRequestHandler):
         print("[mock]", self.command, self.path, fmt % args)
 
     def _check_pwd(self, q):
+        # Mirror worker.js auth chain: header > query > cookie. Dashboard now
+        # sends X-Dashboard-Password header instead of ?pwd=, and media URLs
+        # (<img src=/api/file...>) rely on the dp= cookie set by /api/ping.
+        hdr = self.headers.get("X-Dashboard-Password", "")
+        if hdr == PASSWORD:
+            return True
+        cookie_hdr = self.headers.get("Cookie", "") or ""
+        for part in cookie_hdr.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "dp" and v == PASSWORD:
+                return True
         return q.get("pwd") == PASSWORD
 
     # ─────────────────────────────────────────── GET ───────────────────────────────
@@ -175,7 +186,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/ping":
-            return jbody(self, 200, {"ok": True})
+            # Mirror worker.js: set auth cookie so subsequent <img>/<video>
+            # requests authenticate without ?pwd= in the URL.
+            body = json.dumps({"ok": True}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Set-Cookie", f"dp={PASSWORD}; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict")
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         if path == "/api/bot-info":
             return jbody(self, 200, {"ok": True, "username": "test_panel_bot"})
@@ -400,6 +421,17 @@ class Handler(BaseHTTPRequestHandler):
             STATE["logout_at_ts"] = time.time()
             STATE["post_logout_msg_calls"] = 0
             return jbody(self, 200, {"ok": True})
+
+        if path == "/api/logout":
+            # Stomp the auth cookie like the worker does.
+            body = json.dumps({"ok": True}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", "dp=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict")
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         if path == "/api/refresh-chats":
             return jbody(self, 200, {"ok": True, "chats": CHATS})
