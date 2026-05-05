@@ -991,7 +991,11 @@ async function saveBadWords() {
 // ── MANAGE ───────────────────────────────────────────────────────
 async function loadManage() {
   await loadChatInfo();
-  document.getElementById('confirm-delete').checked = false;
+  // Сбрасываем чекбокс подтверждения зачистки, чтобы каждый заход в таб
+  // требовал нового сознательного клика. Используем optional chaining на
+  // случай если элемент ещё не отрендерен (например в standalone-режиме).
+  const cp = document.getElementById('confirm-purge');
+  if (cp) cp.checked = false;
 }
 async function saveChatEdit() {
   const title = document.getElementById('edit-title').value;
