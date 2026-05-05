@@ -170,8 +170,26 @@ async function handleUpdate(update, env) {
     return;
   }
 
+  // chat_member: ЛЮБЫЕ изменения членов чата (приходят только если бот — админ
+  // и подписан в setWebhook на allowed_updates=chat_member). Это единственный
+  // способ узнать о юзере, который ещё ни разу не писал.
+  if (update.chat_member) {
+    const cm  = update.chat_member;
+    const cid = String(cm.chat.id);
+    const u   = cm.new_chat_member?.user || cm.old_chat_member?.user;
+    const st  = cm.new_chat_member?.status || "";
+    if (u) await cacheUser(env.DB, cid, u, { status: st });
+    await upsertChatMeta(env, cm.chat);
+    return;
+  }
+
   if (update.message?.new_chat_members) {
     await upsertChatMeta(env, update.message.chat);
+    // Записываем всех новых членов в кэш — даже если они потом не напишут.
+    const cid = String(update.message.chat.id);
+    for (const u of update.message.new_chat_members) {
+      try { await cacheUser(env.DB, cid, u, { status: "member" }); } catch {}
+    }
     await handleNewMembers(update.message, env);
     return;
   }
@@ -180,6 +198,10 @@ async function handleUpdate(update, env) {
     const cid = String(update.message.chat.id);
     const uid = String(update.message.left_chat_member.id);
     await env.DB.prepare(`DELETE FROM captcha_pending WHERE chat_id = ? AND user_id = ?`).bind(cid, uid).run();
+    try {
+      await env.DB.prepare(`UPDATE user_cache SET status = 'left' WHERE chat_id = ? AND user_id = ?`)
+        .bind(cid, uid).run();
+    } catch {}
     return;
   }
 
@@ -1868,20 +1890,32 @@ async function autoMod(msg, env, cfg) {
     }
   }
 
-  // Антимат
-  if (cfg.antimat_enabled && hasBadWords(text, cfg.bad_words)) {
-    await delMsg(env, chatId, msg.message_id);
-    const warns = await addWarn(env.DB, chatId, userId);
-    const max   = cfg.max_warns || 3;
-    if (warns >= max) {
-      try { await tg(env, "banChatMember", { chat_id: chatId, user_id: userId }); } catch {}
-      await env.DB.prepare(`DELETE FROM warns WHERE chat_id = ? AND user_id = ?`).bind(chatId, userId).run();
-      await tempMsg(env, chatId, `🚫 ${getUserName(msg.from)} забанен за мат.`, 15);
-    } else {
-      await tempMsg(env, chatId, `⚠️ ${getUserName(msg.from)}, мат удалён. Варн ${warns}/${max}.`, 10);
+  // Антимат — логируем какое именно слово сматчилось, чтобы было видно
+  // в дашборде во вкладке «Антимат-лог».
+  if (cfg.antimat_enabled) {
+    const matched = matchBadWord(text, cfg.bad_words);
+    if (matched) {
+      await delMsg(env, chatId, msg.message_id);
+      const warns = await addWarn(env.DB, chatId, userId);
+      const max   = cfg.max_warns || 3;
+      let action = `варн ${warns}/${max}`;
+      if (warns >= max) {
+        try { await tg(env, "banChatMember", { chat_id: chatId, user_id: userId }); } catch {}
+        await env.DB.prepare(`DELETE FROM warns WHERE chat_id = ? AND user_id = ?`).bind(chatId, userId).run();
+        await tempMsg(env, chatId, `🚫 ${getUserName(msg.from)} забанен за мат.`, 15);
+        action = "бан";
+      } else {
+        await tempMsg(env, chatId, `⚠️ ${getUserName(msg.from)}, мат удалён. Варн ${warns}/${max}.`, 10);
+      }
+      try {
+        await env.DB.prepare(
+          `INSERT INTO antimat_log (chat_id, user_id, user_name, kind, matched, action, ts)
+           VALUES (?, ?, ?, 'antimat', ?, ?, ?)`
+        ).bind(chatId, userId, getUserName(msg.from), matched, action, nowTs()).run();
+      } catch {}
+      await logAct(env, chatId, userId, getUserName(msg.from), `мат «${matched}» ${warns}/${max}`, cfg);
+      return;
     }
-    await logAct(env, chatId, userId, getUserName(msg.from), `мат ${warns}/${max}`, cfg);
-    return;
   }
 
   // Антиссылки
@@ -2051,22 +2085,30 @@ async function getTarget(msg, env, chatId) {
   return null;
 }
 
-// Кэшируем пользователей когда они пишут в чат
-async function cacheUser(db, chatId, user) {
+// Кэшируем пользователей когда они пишут в чат / появляются в событиях.
+// last_seen_at обновляется при каждом «касании», updated_at — только когда
+// меняется что-то существенное (ник, статус). Это нужно чтобы дашборд мог
+// отсортировать участников по «last_seen» и показать «онлайн только что».
+async function cacheUser(db, chatId, user, opts = {}) {
   if (!user?.id) return;
   try {
+    const now = nowTs();
     await db.prepare(
-      `INSERT INTO user_cache (chat_id, user_id, username, display_name, updated_at)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO user_cache
+         (chat_id, user_id, username, display_name, status, updated_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(chat_id, user_id) DO UPDATE SET
          username = excluded.username,
          display_name = excluded.display_name,
-         updated_at = excluded.updated_at`
+         status = CASE WHEN excluded.status = '' THEN user_cache.status ELSE excluded.status END,
+         updated_at = excluded.updated_at,
+         last_seen_at = excluded.last_seen_at`
     ).bind(
       chatId, String(user.id),
       (user.username || "").toLowerCase(),
       getUserName(user),
-      nowTs()
+      opts.status || "",
+      now, now,
     ).run();
   } catch {}
 }
@@ -2169,11 +2211,33 @@ function getCmd(text = "") {
   return m ? m[1].toLowerCase() : null;
 }
 
+// Возвращает первое сматченное стоп-слово, либо null. Поддерживает разделители
+// , и \n в списке. Сравнение по «слову» — границы определяются юникод-aware
+// regex (\b в JS не работает с кириллицей), что снимает false positive на
+// «class» → «ass». Если стоп-слово содержит пробел, сравнение идёт как
+// подстрока (например «куплю аккаунт»).
+function matchBadWord(text, str) {
+  if (!text || !str) return null;
+  const lower = text.toLowerCase().normalize("NFKC");
+  const words = String(str)
+    .split(/[,\n]/)
+    .map(w => w.trim().toLowerCase().normalize("NFKC"))
+    .filter(Boolean);
+  for (const w of words) {
+    if (w.includes(" ")) {
+      if (lower.includes(w)) return w;
+      continue;
+    }
+    // unicode-aware "word boundary": буква/цифра до и после — нет совпадения.
+    const escaped = w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp("(^|[^\\p{L}\\p{N}])" + escaped + "(?=[^\\p{L}\\p{N}]|$)", "u");
+    if (re.test(lower)) return w;
+  }
+  return null;
+}
+
 function hasBadWords(text, str) {
-  if (!text || !str) return false;
-  const words = str.split(",").map(w => w.trim().toLowerCase()).filter(Boolean);
-  const lower = text.toLowerCase();
-  return words.some(w => lower.includes(w));
+  return matchBadWord(text, str) !== null;
 }
 
 function hasLinks(text) {
@@ -2325,8 +2389,29 @@ async function getConfig(db, chatId) {
   return row || {};
 }
 
+// Whitelist of columns we let the dashboard / commands write to. Avoids
+// SQL injection through `key` and protects against silent typos.
+const SETTABLE_KEYS = new Set([
+  "antimat_enabled", "antilinks_enabled", "antiflood_enabled",
+  "antinsfw_enabled", "captcha_enabled", "welcome_enabled",
+  "max_warns", "flood_limit", "flood_window",
+  "bad_words", "log_chat_id", "rules_text", "welcome_text",
+]);
+
 async function setSetting(db, chatId, key, value) {
-  await db.prepare(`UPDATE chat_settings SET ${key} = ? WHERE chat_id = ?`).bind(value, chatId).run();
+  if (!SETTABLE_KEYS.has(key)) {
+    throw new Error("setSetting: unknown key " + key);
+  }
+  // Upsert: ensure the row exists so the UPDATE actually persists.
+  // The previous version used a bare UPDATE, which silently affected 0 rows
+  // for chats whose chat_settings row had never been created (e.g. brand-new
+  // chats whose config is being edited from the dashboard before any message
+  // has been processed). That made `bad_words`, `antimat_enabled`, etc. seem
+  // to "save" while the value never made it to the DB.
+  await db.prepare(
+    `INSERT INTO chat_settings (chat_id, ${key}) VALUES (?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET ${key} = excluded.${key}`
+  ).bind(chatId, value).run();
 }
 
 async function logAct(env, chatId, userId, userName, action, cfg) {
@@ -2514,14 +2599,33 @@ async function ensureSchema(db) {
       last_seen    INTEGER NOT NULL DEFAULT 0,
       removed      INTEGER NOT NULL DEFAULT 0
     )`,
+
+    // Лог анти-мата / анти-ссылок / анти-флуда — какое слово сматчилось,
+    // какое наказание выписано. Видно во вкладке «Антимат-лог».
+    `CREATE TABLE IF NOT EXISTS antimat_log (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id   TEXT    NOT NULL,
+      user_id   TEXT    NOT NULL,
+      user_name TEXT    NOT NULL DEFAULT '',
+      kind      TEXT    NOT NULL DEFAULT 'antimat',
+      matched   TEXT    NOT NULL DEFAULT '',
+      action    TEXT    NOT NULL DEFAULT '',
+      ts        INTEGER NOT NULL DEFAULT 0
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_antimat_chat ON antimat_log(chat_id, ts DESC)`,
   ];
   for (const sql of stmts) {
     await db.prepare(sql).run();
   }
 
-  // Миграции для существующих баз
+  // Миграции для существующих баз. Каждая обёрнута в try/catch — если колонка
+  // уже есть, ALTER кинет ошибку, и это нормально.
   const migrations = [
     `ALTER TABLE chat_settings ADD COLUMN rules_text TEXT DEFAULT ''`,
+    `ALTER TABLE user_cache ADD COLUMN avatar_path TEXT DEFAULT ''`,
+    `ALTER TABLE user_cache ADD COLUMN avatar_fetched_at INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE user_cache ADD COLUMN status TEXT DEFAULT ''`,
+    `ALTER TABLE user_cache ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0`,
   ];
   for (const m of migrations) {
     try { await db.prepare(m).run(); } catch {}
@@ -2817,36 +2921,298 @@ async function handleDashboardApi(request, env, url) {
     }
 
     // ── УЧАСТНИКИ ────────────────────────────────────────────────────────
-    // GET /api/members?chat_id=&q=&limit=
+    // GET /api/members?chat_id=&q=&limit=&sort=
+    // sort: rank | recent | warns | rep | name (default: rank)
     if (path === "/api/members" && chatId && isGet) {
       const q = (url.searchParams.get("q") || "").trim().toLowerCase();
-      const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 200));
-      const rows = q
-        ? await env.DB.prepare(
-            `SELECT uc.user_id, uc.username, uc.display_name, uc.updated_at,
+      const limit = Math.max(1, Math.min(2000, Number(url.searchParams.get("limit")) || 500));
+      const sort = url.searchParams.get("sort") || "rank";
+      const orderBy = ({
+        rank:   "rank_level DESC, last_seen_at DESC, updated_at DESC",
+        recent: "last_seen_at DESC, updated_at DESC",
+        warns:  "warns DESC, last_seen_at DESC",
+        rep:    "rep DESC, last_seen_at DESC",
+        name:   "LOWER(uc.display_name) ASC",
+      })[sort] || "rank_level DESC, last_seen_at DESC, updated_at DESC";
+      const cols = `uc.user_id, uc.username, uc.display_name, uc.updated_at,
+                    uc.last_seen_at, uc.status, uc.avatar_path,
                     COALESCE(s.rank_level, 0) as rank_level,
                     COALESCE(w.count, 0)      as warns,
-                    COALESCE(r.rep, 0)        as rep
+                    COALESCE(r.rep, 0)        as rep`;
+      const rows = q
+        ? await env.DB.prepare(
+            `SELECT ${cols}
              FROM user_cache uc
              LEFT JOIN staff      s ON s.chat_id = uc.chat_id AND s.user_id = uc.user_id
              LEFT JOIN warns      w ON w.chat_id = uc.chat_id AND w.user_id = uc.user_id
              LEFT JOIN reputation r ON r.chat_id = uc.chat_id AND r.user_id = uc.user_id
              WHERE uc.chat_id = ? AND (LOWER(uc.username) LIKE ? OR LOWER(uc.display_name) LIKE ?)
-             ORDER BY rank_level DESC, uc.updated_at DESC LIMIT ?`
+             ORDER BY ${orderBy} LIMIT ?`
           ).bind(chatId, `%${q}%`, `%${q}%`, limit).all()
         : await env.DB.prepare(
-            `SELECT uc.user_id, uc.username, uc.display_name, uc.updated_at,
-                    COALESCE(s.rank_level, 0) as rank_level,
-                    COALESCE(w.count, 0)      as warns,
-                    COALESCE(r.rep, 0)        as rep
+            `SELECT ${cols}
              FROM user_cache uc
              LEFT JOIN staff      s ON s.chat_id = uc.chat_id AND s.user_id = uc.user_id
              LEFT JOIN warns      w ON w.chat_id = uc.chat_id AND w.user_id = uc.user_id
              LEFT JOIN reputation r ON r.chat_id = uc.chat_id AND r.user_id = uc.user_id
              WHERE uc.chat_id = ?
-             ORDER BY rank_level DESC, uc.updated_at DESC LIMIT ?`
+             ORDER BY ${orderBy} LIMIT ?`
           ).bind(chatId, limit).all();
-      return json({ members: rows.results || [] });
+      const total = await env.DB.prepare(
+        `SELECT COUNT(*) as c FROM user_cache WHERE chat_id = ?`
+      ).bind(chatId).first();
+      return json({ members: rows.results || [], total: Number(total?.c || 0) });
+    }
+
+    // GET /api/avatar?chat_id=&user_id= — прокси для аватарки. Берём cached
+    // file_path из user_cache.avatar_path, если устарел (>24h) — обновляем
+    // через getUserProfilePhotos + getFile. Возвращаем сами байты, чтобы
+    // не светить BOT_TOKEN в URL для дашборда.
+    if (path === "/api/avatar" && isGet && chatId) {
+      const uid = url.searchParams.get("user_id") || "";
+      if (!uid) return json({ error: "user_id required" }, 400);
+      const row = await env.DB.prepare(
+        `SELECT avatar_path, avatar_fetched_at FROM user_cache WHERE chat_id = ? AND user_id = ?`
+      ).bind(chatId, uid).first();
+      let filePath = row?.avatar_path || "";
+      const fetchedAt = Number(row?.avatar_fetched_at || 0);
+      // Refresh only if we never fetched OR cache is older than 24 hours.
+      // Don't refetch on every empty-path hit — а то юзер без аватарки
+      // долбит getUserProfilePhotos на каждый рендер списка.
+      const needsFetch = !fetchedAt || (nowTs() - fetchedAt) > 86400;
+      if (needsFetch) {
+        try {
+          const ph = await tg(env, "getUserProfilePhotos", { user_id: Number(uid), limit: 1 });
+          const fileId = ph?.photos?.[0]?.[0]?.file_id;
+          if (fileId) {
+            const f = await tg(env, "getFile", { file_id: fileId });
+            filePath = f?.file_path || "";
+          } else {
+            filePath = "";
+          }
+          await env.DB.prepare(
+            `UPDATE user_cache SET avatar_path = ?, avatar_fetched_at = ? WHERE chat_id = ? AND user_id = ?`
+          ).bind(filePath, nowTs(), chatId, uid).run();
+        } catch {
+          // не валим запрос: если нет фото / приватный профиль — просто 404
+        }
+      }
+      if (!filePath) return new Response("no avatar", { status: 404 });
+      const tgUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`;
+      const upstream = await fetch(tgUrl);
+      if (!upstream.ok) return new Response("upstream " + upstream.status, { status: 502 });
+      return new Response(upstream.body, {
+        status: 200,
+        headers: {
+          "content-type": upstream.headers.get("content-type") || "image/jpeg",
+          "cache-control": "public, max-age=86400",
+          "access-control-allow-origin": "*",
+        },
+      });
+    }
+
+    // POST /api/sync-admins { chat_id } — подтянуть админов через
+    // getChatAdministrators и записать их в staff + user_cache.
+    if (path === "/api/sync-admins" && request.method === "POST") {
+      const body = await request.json();
+      const cid  = String(body.chat_id || "");
+      if (!cid) return json({ error: "chat_id required" }, 400);
+      try {
+        const admins = await tg(env, "getChatAdministrators", { chat_id: cid });
+        let added = 0;
+        for (const a of admins || []) {
+          if (a.user?.is_bot) continue;
+          const lvl = a.status === "creator" ? 7 : 5; // owner=⭐, admin=🟠
+          try {
+            await cacheUser(env.DB, cid, a.user, { status: a.status });
+            await env.DB.prepare(
+              `INSERT INTO staff (chat_id, user_id, rank_level, promoted_by, updated_at)
+               VALUES (?, ?, ?, 'sync', ?)
+               ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                 rank_level = MAX(staff.rank_level, excluded.rank_level),
+                 updated_at = excluded.updated_at`
+            ).bind(cid, String(a.user.id), lvl, nowTs()).run();
+            added++;
+          } catch {}
+        }
+        return json({ ok: true, added, total: (admins || []).length });
+      } catch (err) {
+        return json({ ok: false, error: String(err) }, 200);
+      }
+    }
+
+    // GET /api/user-info?chat_id=&user_id= — полный профиль для модалки.
+    if (path === "/api/user-info" && isGet && chatId) {
+      const uid = url.searchParams.get("user_id") || "";
+      if (!uid) return json({ error: "user_id required" }, 400);
+      const u = await env.DB.prepare(
+        `SELECT uc.user_id, uc.username, uc.display_name, uc.updated_at,
+                uc.last_seen_at, uc.status,
+                COALESCE(s.rank_level, 0) as rank_level,
+                COALESCE(w.count, 0)      as warns,
+                COALESCE(r.rep, 0)        as rep
+         FROM user_cache uc
+         LEFT JOIN staff      s ON s.chat_id = uc.chat_id AND s.user_id = uc.user_id
+         LEFT JOIN warns      w ON w.chat_id = uc.chat_id AND w.user_id = uc.user_id
+         LEFT JOIN reputation r ON r.chat_id = uc.chat_id AND r.user_id = uc.user_id
+         WHERE uc.chat_id = ? AND uc.user_id = ?`
+      ).bind(chatId, uid).first();
+      if (!u) return json({ error: "not found" }, 404);
+      const recent = await env.DB.prepare(
+        `SELECT message_id, text, kind, ts FROM chat_messages
+         WHERE chat_id = ? AND user_id = ? ORDER BY message_id DESC LIMIT 20`
+      ).bind(chatId, uid).all();
+      const events = await env.DB.prepare(
+        `SELECT kind, matched, action, ts FROM antimat_log
+         WHERE chat_id = ? AND user_id = ? ORDER BY id DESC LIMIT 20`
+      ).bind(chatId, uid).all();
+      let tg_status = null;
+      try {
+        const m = await tg(env, "getChatMember", { chat_id: chatId, user_id: Number(uid) });
+        tg_status = m?.status || null;
+      } catch {}
+      return json({
+        user: u,
+        recent_messages: recent.results || [],
+        antimat_events: events.results || [],
+        tg_status,
+      });
+    }
+
+    // GET /api/antimat-log?chat_id=&limit=
+    if (path === "/api/antimat-log" && isGet && chatId) {
+      const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit")) || 100));
+      const rows = await env.DB.prepare(
+        `SELECT id, user_id, user_name, kind, matched, action, ts
+         FROM antimat_log WHERE chat_id = ? ORDER BY id DESC LIMIT ?`
+      ).bind(chatId, limit).all();
+      return json({ events: rows.results || [] });
+    }
+
+    // GET /api/activity?chat_id= — гистограмма сообщений по часам за 7 дней.
+    if (path === "/api/activity" && isGet && chatId) {
+      const since = nowTs() - 7 * 86400;
+      const rows = await env.DB.prepare(
+        `SELECT ts FROM chat_messages WHERE chat_id = ? AND ts >= ? ORDER BY ts ASC`
+      ).bind(chatId, since).all();
+      const buckets = new Array(7 * 24).fill(0);
+      const startBucket = Math.floor(since / 3600);
+      for (const r of rows.results || []) {
+        const idx = Math.floor(Number(r.ts) / 3600) - startBucket;
+        if (idx >= 0 && idx < buckets.length) buckets[idx]++;
+      }
+      return json({ buckets, start_ts: since, total: (rows.results || []).length });
+    }
+
+    // POST /api/bulk { chat_id, action, user_ids[], duration_sec? }
+    // action: kick | ban | unban | mute | unmute | setrank
+    if (path === "/api/bulk" && request.method === "POST") {
+      const body = await request.json();
+      const cid = String(body.chat_id || "");
+      const action = String(body.action || "");
+      const ids = Array.isArray(body.user_ids) ? body.user_ids.map(String) : [];
+      if (!cid || !action || !ids.length) return json({ error: "chat_id, action, user_ids required" }, 400);
+      const allowed = ["kick", "ban", "unban", "mute", "unmute", "setrank"];
+      if (!allowed.includes(action)) return json({ error: "unknown action" }, 400);
+      const dur = Math.max(60, Number(body.duration_sec) || 3600);
+      const lvl = Math.max(0, Math.min(7, Number(body.level) || 0));
+      let ok = 0, errors = [];
+      for (const uid of ids) {
+        const u = Number(uid); if (!u) continue;
+        try {
+          if (action === "kick") {
+            await tg(env, "banChatMember", { chat_id: cid, user_id: u });
+            try { await tg(env, "unbanChatMember", { chat_id: cid, user_id: u, only_if_banned: true }); } catch {}
+          } else if (action === "ban") {
+            await tg(env, "banChatMember", { chat_id: cid, user_id: u });
+          } else if (action === "unban") {
+            await tg(env, "unbanChatMember", { chat_id: cid, user_id: u, only_if_banned: true });
+          } else if (action === "mute") {
+            await tg(env, "restrictChatMember", {
+              chat_id: cid, user_id: u, until_date: nowTs() + dur,
+              permissions: { can_send_messages: false, can_send_audios: false, can_send_documents: false, can_send_photos: false, can_send_videos: false, can_send_video_notes: false, can_send_voice_notes: false, can_send_polls: false, can_send_other_messages: false, can_add_web_page_previews: false },
+            });
+          } else if (action === "unmute") {
+            await tg(env, "restrictChatMember", {
+              chat_id: cid, user_id: u,
+              permissions: { can_send_messages: true, can_send_audios: true, can_send_documents: true, can_send_photos: true, can_send_videos: true, can_send_video_notes: true, can_send_voice_notes: true, can_send_polls: true, can_send_other_messages: true, can_add_web_page_previews: true },
+            });
+          } else if (action === "setrank") {
+            await env.DB.prepare(
+              `INSERT INTO staff (chat_id, user_id, rank_level, promoted_by, updated_at)
+               VALUES (?, ?, ?, 'bulk', ?)
+               ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                 rank_level = excluded.rank_level, updated_at = excluded.updated_at`
+            ).bind(cid, String(u), lvl, nowTs()).run();
+          }
+          ok++;
+        } catch (err) {
+          if (errors.length < 30) errors.push({ user_id: uid, error: String(err) });
+        }
+      }
+      return json({ ok: true, processed: ok, errors });
+    }
+
+    // POST /api/broadcast { text, parse_mode?, chat_ids? }
+    // Если chat_ids не передан — рассылка во ВСЕ известные чаты (removed = 0).
+    if (path === "/api/broadcast" && request.method === "POST") {
+      const body = await request.json();
+      const txt = String(body.text || "");
+      if (!txt) return json({ error: "text required" }, 400);
+      let chatIds = Array.isArray(body.chat_ids) ? body.chat_ids.map(String) : [];
+      if (!chatIds.length) {
+        const rows = await env.DB.prepare(
+          `SELECT chat_id FROM chat_meta WHERE removed = 0`
+        ).all();
+        chatIds = (rows.results || []).map(r => String(r.chat_id));
+      }
+      let sent = 0, errors = [];
+      for (const cid of chatIds) {
+        try {
+          const params = { chat_id: cid, text: txt };
+          if (body.parse_mode) params.parse_mode = String(body.parse_mode);
+          if (body.disable_web_page_preview) params.disable_web_page_preview = true;
+          await tg(env, "sendMessage", params);
+          sent++;
+        } catch (err) {
+          if (errors.length < 30) errors.push({ chat_id: cid, error: String(err) });
+        }
+      }
+      return json({ ok: true, sent, total: chatIds.length, errors });
+    }
+
+    // GET /api/search?chat_id=&q=&limit= — поиск по сообщениям этого чата
+    if (path === "/api/search" && isGet && chatId) {
+      const q = (url.searchParams.get("q") || "").trim();
+      const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit")) || 50));
+      if (!q) return json({ messages: [] });
+      const rows = await env.DB.prepare(
+        `SELECT message_id, user_id, user_name, text, kind, ts
+         FROM chat_messages WHERE chat_id = ? AND LOWER(text) LIKE ?
+         ORDER BY id DESC LIMIT ?`
+      ).bind(chatId, `%${q.toLowerCase()}%`, limit).all();
+      return json({ messages: rows.results || [], q });
+    }
+
+    // GET /api/export?chat_id= — JSON-экспорт всех данных по чату.
+    if (path === "/api/export" && isGet && chatId) {
+      const tables = ["chat_settings", "chat_meta", "staff", "warns",
+        "reputation", "user_cache", "chat_messages", "antimat_log"];
+      const out = {};
+      for (const t of tables) {
+        try {
+          const r = await env.DB.prepare(`SELECT * FROM ${t} WHERE chat_id = ?`).bind(chatId).all();
+          out[t] = r.results || [];
+        } catch { out[t] = []; }
+      }
+      return new Response(JSON.stringify(out, null, 2), {
+        status: 200,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "content-disposition": `attachment; filename="chat-${chatId}.json"`,
+          "access-control-allow-origin": "*",
+        },
+      });
     }
 
     // ── МОДЕРАЦИЯ ────────────────────────────────────────────────────────
@@ -3269,9 +3635,59 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .list-row{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)}
   .list-row:last-child{border-bottom:none}
   .list-row .grow{flex:1;min-width:0}
+  .list-row.selected{background:rgba(232,255,0,.04);border-radius:8px}
+  .list-row.clickable{cursor:pointer}
+  .list-row.clickable:hover{background:rgba(232,255,0,.03)}
   .list-name{font-weight:600;color:var(--text);word-break:break-word}
   .list-sub{font-size:12px;color:var(--muted)}
   .row-actions{display:flex;gap:6px;flex-wrap:wrap}
+
+  /* avatars: real photo or fallback letters */
+  .avatar{width:40px;height:40px;border-radius:12px;flex-shrink:0;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-family:'Russo One',sans-serif;font-size:13px;color:#000;overflow:hidden;position:relative}
+  .avatar img{width:100%;height:100%;object-fit:cover;display:block}
+  .avatar .status-dot{position:absolute;bottom:-2px;right:-2px;width:12px;height:12px;border-radius:50%;border:2px solid var(--surface)}
+  .status-creator{background:#ffd700}
+  .status-administrator{background:#ff7a00}
+  .status-member{background:#00e676}
+  .status-restricted{background:#ffb300}
+  .status-left,.status-kicked{background:#ff3b5c}
+
+  /* bulk-bar */
+  .bulk-bar{position:sticky;top:8px;z-index:5;background:var(--surface2);border:1px solid var(--border-h);border-radius:12px;padding:10px 14px;display:none;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .bulk-bar.visible{display:flex}
+  .bulk-bar .count{font-family:'Russo One',sans-serif;color:var(--accent);font-size:14px}
+  .checkbox{width:18px;height:18px;border-radius:5px;border:1.5px solid var(--border-h);background:var(--bg);cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s}
+  .checkbox.on{background:var(--accent);border-color:var(--accent)}
+  .checkbox.on::after{content:'✓';color:#000;font-weight:900;font-size:12px;line-height:1}
+
+  /* modal */
+  .modal-backdrop{position:fixed;inset:0;background:rgba(5,8,15,.78);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:200;padding:24px}
+  .modal-backdrop.visible{display:flex}
+  .modal{background:var(--surface);border:1px solid var(--border-h);border-radius:18px;width:560px;max-width:100%;max-height:90vh;overflow:auto;box-shadow:0 24px 80px rgba(0,0,0,.6)}
+  .modal-head{padding:18px 22px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px}
+  .modal-head .avatar{width:56px;height:56px;border-radius:16px;font-size:18px}
+  .modal-head .grow{flex:1;min-width:0}
+  .modal-head .modal-name{font-family:'Russo One',sans-serif;font-size:18px;letter-spacing:1px}
+  .modal-head .modal-sub{font-size:12px;color:var(--muted);margin-top:4px}
+  .modal-close{background:transparent;border:none;color:var(--muted);font-size:22px;cursor:pointer;padding:4px 10px;border-radius:8px}
+  .modal-close:hover{background:var(--surface2);color:var(--text)}
+  .modal-body{padding:18px 22px;display:flex;flex-direction:column;gap:16px}
+  .info-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+  .info-cell{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
+  .info-cell .info-label{font-size:11px;color:var(--muted);letter-spacing:1px;text-transform:uppercase}
+  .info-cell .info-value{font-weight:700;margin-top:4px;word-break:break-word}
+  .modal-section-title{font-family:'Russo One',sans-serif;color:var(--accent);font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px}
+
+  /* activity chart */
+  .activity-chart{display:flex;align-items:flex-end;gap:2px;height:80px;padding:10px 0;border-bottom:1px solid var(--border)}
+  .activity-bar{flex:1;background:linear-gradient(to top,var(--accent2),var(--accent));border-radius:2px 2px 0 0;min-height:2px;transition:opacity .15s}
+  .activity-bar:hover{opacity:.75}
+  .activity-bar.empty{background:var(--border)}
+
+  /* small chips */
+  .chip{display:inline-flex;align-items:center;gap:4px;background:var(--surface2);border:1px solid var(--border);border-radius:999px;padding:4px 10px;font-size:12px;cursor:pointer;color:var(--muted);transition:all .15s}
+  .chip:hover{border-color:var(--accent)}
+  .chip.active{background:var(--accent);color:#000;border-color:var(--accent);font-weight:700}
 
   /* settings */
   .setting-row{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border);gap:12px}
@@ -3386,9 +3802,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="tab" data-tab="members">👥 Участники</div>
       <div class="tab" data-tab="staff">👮 Стафф</div>
       <div class="tab" data-tab="modlog">📋 Лог</div>
+      <div class="tab" data-tab="antimat">🚫 Антимат</div>
       <div class="tab" data-tab="top">🏆 Топы</div>
       <div class="tab" data-tab="clans">⚔️ Кланы</div>
       <div class="tab" data-tab="rules">📜 Правила</div>
+      <div class="tab" data-tab="broadcast">📣 Рассылка</div>
       <div class="tab" data-tab="settings">⚙️ Настройки</div>
       <div class="tab" data-tab="manage">🔧 Управление</div>
     </div>
@@ -3412,6 +3830,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
             <div class="panel-header"><div class="panel-title">Топ нарушителей</div></div>
             <div class="panel-body" id="top-violators"></div>
           </div>
+        </div>
+        <div class="panel mt-20">
+          <div class="panel-header"><div class="panel-title">Активность за 7 дней (по часам)</div><span class="small muted" id="activity-meta"></span></div>
+          <div class="panel-body"><div id="activity-chart" class="activity-chart"><div class="empty-state small">…</div></div></div>
         </div>
         <div class="panel mt-20">
           <div class="panel-header"><div class="panel-title">Информация о чате</div><button class="btn btn-sm" onclick="loadChatInfo()">↻ Обновить</button></div>
@@ -3461,13 +3883,32 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <div id="sec-members" class="section">
         <div class="panel">
           <div class="panel-header">
-            <div class="panel-title">Участники (кэш бота)</div>
+            <div class="panel-title">Участники <span class="small muted" id="members-count" style="margin-left:8px"></span></div>
             <div class="row">
-              <input id="members-q" class="input" placeholder="Поиск по имени или @username" style="max-width:280px" oninput="onMembersSearch()">
+              <input id="members-q" class="input" placeholder="Поиск по имени или @username" style="max-width:260px" oninput="onMembersSearch()">
+              <button class="btn btn-sm" onclick="syncAdmins()" title="Подтянуть админов из Telegram">⤴ Админы</button>
               <button class="btn btn-sm" onclick="loadMembers()">↻</button>
             </div>
           </div>
-          <div class="panel-body" id="members-list"><div class="empty-state small">Загрузка…</div></div>
+          <div class="panel-body">
+            <div class="row mb-12" style="gap:6px;flex-wrap:wrap">
+              <span class="chip active" data-sort="rank" onclick="setMembersSort('rank')">по рангу</span>
+              <span class="chip" data-sort="recent" onclick="setMembersSort('recent')">недавно писали</span>
+              <span class="chip" data-sort="warns" onclick="setMembersSort('warns')">по варнам</span>
+              <span class="chip" data-sort="rep" onclick="setMembersSort('rep')">по репутации</span>
+              <span class="chip" data-sort="name" onclick="setMembersSort('name')">по имени</span>
+            </div>
+            <div id="bulk-bar" class="bulk-bar">
+              <span class="count" id="bulk-count">0 выбрано</span>
+              <button class="btn btn-sm" onclick="bulkRun('mute')">🔇 Мут</button>
+              <button class="btn btn-sm" onclick="bulkRun('unmute')">🔊 Размут</button>
+              <button class="btn btn-sm" onclick="bulkRun('kick')">👢 Кик</button>
+              <button class="btn btn-sm btn-danger" onclick="bulkRun('ban')">🔨 Бан</button>
+              <button class="btn btn-sm" onclick="bulkRun('setrank')">⚙ Ранг…</button>
+              <button class="btn btn-sm" onclick="bulkClear()" style="margin-left:auto">Сбросить</button>
+            </div>
+            <div id="members-list"><div class="empty-state small">Загрузка…</div></div>
+          </div>
         </div>
       </div>
 
@@ -3484,6 +3925,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <div class="panel">
           <div class="panel-header"><div class="panel-title">Журнал модерации</div></div>
           <div class="panel-body" id="modlog-list"></div>
+        </div>
+      </div>
+
+      <!-- ANTIMAT LOG -->
+      <div id="sec-antimat" class="section">
+        <div class="panel">
+          <div class="panel-header">
+            <div class="panel-title">Анти-мат: что и кого зацепило</div>
+            <button class="btn btn-sm" onclick="loadAntimat()">↻ Обновить</button>
+          </div>
+          <div class="panel-body" id="antimat-list"><div class="empty-state small">Загрузка…</div></div>
         </div>
       </div>
 
@@ -3518,6 +3970,29 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           </div>
           <div class="panel-body">
             <textarea id="rules-text" class="textarea" rows="14" placeholder="Текст правил..."></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- BROADCAST -->
+      <div id="sec-broadcast" class="section">
+        <div class="panel">
+          <div class="panel-header"><div class="panel-title">Рассылка во все чаты</div></div>
+          <div class="panel-body">
+            <div class="small muted mb-12">Отправит сообщение во все чаты, где бот сейчас находится. Поддерживается Markdown / HTML.</div>
+            <textarea id="broadcast-text" class="textarea" rows="6" placeholder="Текст рассылки..."></textarea>
+            <div class="row mt-12">
+              <select id="broadcast-mode" class="select" style="max-width:200px">
+                <option value="">Plain</option>
+                <option value="HTML">HTML</option>
+                <option value="Markdown">Markdown</option>
+                <option value="MarkdownV2">MarkdownV2</option>
+              </select>
+              <label class="check-row" style="margin:0"><input type="checkbox" id="broadcast-nopreview"> без превью ссылок</label>
+              <label class="check-row" style="margin:0"><input type="checkbox" id="broadcast-only-this"> только в этот чат</label>
+              <button class="btn btn-accent" onclick="sendBroadcast()" style="margin-left:auto">Разослать →</button>
+            </div>
+            <div id="broadcast-result" class="small muted mt-12"></div>
           </div>
         </div>
       </div>
@@ -3589,6 +4064,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           </div>
         </div>
 
+        <div class="panel mt-20">
+          <div class="panel-header"><div class="panel-title">Экспорт данных чата</div></div>
+          <div class="panel-body">
+            <div class="small muted mb-12">Скачать JSON со всеми настройками, стаффом, варнами, репутацией, сообщениями, событиями анти-мата по этому чату. Удобно для бэкапов.</div>
+            <button class="btn" onclick="exportChat()">⬇️ Скачать chat.json</button>
+          </div>
+        </div>
+
         <div class="danger-card mt-20">
           <div class="danger-title">⚠ Опасная зона — зачистка чата</div>
           <div class="danger-desc">
@@ -3615,6 +4098,21 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </div>
 
 <div id="toast"></div>
+
+<!-- USER PROFILE MODAL -->
+<div id="user-modal" class="modal-backdrop" onclick="if(event.target===this)closeUserModal()">
+  <div class="modal">
+    <div class="modal-head">
+      <div class="avatar" id="um-avatar">?</div>
+      <div class="grow">
+        <div class="modal-name" id="um-name">…</div>
+        <div class="modal-sub" id="um-sub">…</div>
+      </div>
+      <button class="modal-close" onclick="closeUserModal()" aria-label="Закрыть">×</button>
+    </div>
+    <div class="modal-body" id="um-body"></div>
+  </div>
+</div>
 
 <script>
 const API = '';
@@ -3796,14 +4294,16 @@ function showTab(name) {
   document.getElementById('sec-' + name).classList.add('active');
   if (FEED_TIMER) { clearInterval(FEED_TIMER); FEED_TIMER = null; }
   if (!CHAT_ID) return;
-  if (name === 'dashboard') { loadStats(); loadRecentFeed(); loadChatInfo(); }
+  if (name === 'dashboard') { loadStats(); loadRecentFeed(); loadChatInfo(); loadActivity(); }
   else if (name === 'feed') { loadFeed(); FEED_TIMER = setInterval(() => { if (document.getElementById('feed-auto').checked) loadFeed(true); }, 4000); }
   else if (name === 'members') loadMembers();
   else if (name === 'staff') loadStaff();
   else if (name === 'modlog') loadModLog();
+  else if (name === 'antimat') loadAntimat();
   else if (name === 'top') loadTop();
   else if (name === 'clans') loadClans();
   else if (name === 'rules') loadRules();
+  else if (name === 'broadcast') { /* статичный таб, ничего грузить */ }
   else if (name === 'settings') loadSettings();
   else if (name === 'manage') loadManage();
 }
@@ -3922,35 +4422,106 @@ async function sendMessage() {
 
 // ── MEMBERS ──────────────────────────────────────────────────────
 let MEMBERS_DEBOUNCE = null;
+let MEMBERS_SORT = 'rank';
+const MEMBERS_SELECTED = new Set();
 function onMembersSearch() { clearTimeout(MEMBERS_DEBOUNCE); MEMBERS_DEBOUNCE = setTimeout(loadMembers, 250); }
+function setMembersSort(s) {
+  MEMBERS_SORT = s;
+  document.querySelectorAll('.chip[data-sort]').forEach(c => c.classList.toggle('active', c.dataset.sort === s));
+  loadMembers();
+}
+function fmtAgo(ts) {
+  const t = Number(ts) || 0;
+  if (!t) return '';
+  const d = Math.floor(Date.now() / 1000) - t;
+  if (d < 60)    return d + ' сек назад';
+  if (d < 3600)  return Math.floor(d / 60) + ' мин назад';
+  if (d < 86400) return Math.floor(d / 3600) + ' ч назад';
+  return Math.floor(d / 86400) + ' дн назад';
+}
+// Глобальный обработчик «не загрузилась аватарка» → подменяем <img> на инициалы
+// через data-init. Делаем глобально, чтобы не клеить inline JS со строкой
+// (которая ломалась бы на одинарных кавычках в имени).
+function avatarFallback(img) {
+  const init = img.getAttribute('data-init') || '?';
+  const parent = img.parentNode;
+  if (!parent) return;
+  // удаляем сам img, оставляя status-dot и подставляя текст
+  img.remove();
+  // вставляем инициалы перед status-dot (если он есть) или в конец
+  const dot = parent.querySelector('.status-dot');
+  const tn = document.createTextNode(init);
+  if (dot) parent.insertBefore(tn, dot);
+  else parent.appendChild(tn);
+}
+function avatarHtml(m) {
+  // Если у юзера известна аватарка — показываем <img>. Если нет (или в
+  // standalone где /api/avatar даст 404) — fallback на инициалы.
+  const init = esc(initials(m.display_name || 'U'));
+  const dot  = esc(m.status || '');
+  const dotEl = dot ? '<span class="status-dot status-' + dot + '"></span>' : '';
+  if (m.avatar_path) {
+    const u = '/api/avatar?chat_id=' + encodeURIComponent(CHAT_ID) + '&user_id=' + encodeURIComponent(m.user_id);
+    return '<div class="avatar"><img src="' + esc(u) + '" alt="" data-init="' + init + '" onerror="avatarFallback(this)">' + dotEl + '</div>';
+  }
+  return '<div class="avatar">' + init + dotEl + '</div>';
+}
+function updateBulkBar() {
+  const bar = document.getElementById('bulk-bar');
+  const cnt = MEMBERS_SELECTED.size;
+  bar.classList.toggle('visible', cnt > 0);
+  document.getElementById('bulk-count').textContent = cnt + ' выбрано';
+  document.querySelectorAll('.list-row[data-uid]').forEach(row => {
+    const sel = MEMBERS_SELECTED.has(row.dataset.uid);
+    row.classList.toggle('selected', sel);
+    const cb = row.querySelector('.checkbox');
+    if (cb) cb.classList.toggle('on', sel);
+  });
+}
+function bulkClear() { MEMBERS_SELECTED.clear(); updateBulkBar(); }
 async function loadMembers() {
   const q = document.getElementById('members-q').value.trim();
   const el = document.getElementById('members-list');
   el.innerHTML = '<div class="empty-state small">Загрузка…</div>';
   try {
-    const d = await apiGet('/api/members?chat_id=' + CHAT_ID + '&q=' + encodeURIComponent(q) + '&limit=200');
+    const d = await apiGet('/api/members?chat_id=' + CHAT_ID
+      + '&q=' + encodeURIComponent(q)
+      + '&sort=' + MEMBERS_SORT
+      + '&limit=500');
+    document.getElementById('members-count').textContent = d.total ? '· всего в кэше: ' + d.total : '';
     if (!d.members?.length) { el.innerHTML = '<div class="empty-state small">Нет совпадений</div>'; return; }
     el.innerHTML = d.members.map(m => {
       const name = esc(m.display_name || ('user_' + m.user_id));
       const uname = m.username ? '@' + esc(m.username) : '';
-      return '<div class="list-row" data-uid="' + esc(m.user_id) + '" data-name="' + name + '" data-rank="' + (m.rank_level || 0) + '">'
-        + '<div class="chat-avatar" style="width:36px;height:36px;font-size:13px;border-radius:10px;flex-shrink:0">' + esc(initials(m.display_name || 'U')) + '</div>'
-        + '<div class="grow">'
+      const seen = m.last_seen_at ? fmtAgo(m.last_seen_at) : 'не видел';
+      return '<div class="list-row clickable" data-uid="' + esc(m.user_id) + '" data-name="' + name + '" data-rank="' + (m.rank_level || 0) + '">'
+        + '<div class="checkbox" data-bulk-toggle></div>'
+        + avatarHtml(m)
+        + '<div class="grow" data-open-profile>'
         +   '<div class="list-name">' + name + ' ' + rankBadge(m.rank_level) + '</div>'
-        +   '<div class="list-sub">' + uname + ' · id ' + esc(m.user_id) + ' · ⚠ ' + (m.warns||0) + ' · ★ ' + (m.rep||0) + '</div>'
+        +   '<div class="list-sub">' + uname + ' · id ' + esc(m.user_id) + ' · ⚠ ' + (m.warns||0) + ' · ★ ' + (m.rep||0) + ' · ' + esc(seen) + '</div>'
         + '</div>'
         + '<div class="row-actions">'
-        +   '<button class="btn btn-sm" data-mem-act="mute">🔇 Мут</button>'
-        +   '<button class="btn btn-sm" data-mem-act="kick">👢 Кик</button>'
-        +   '<button class="btn btn-sm btn-danger" data-mem-act="ban">🔨 Бан</button>'
-        +   '<button class="btn btn-sm" data-mem-act="rank">⚙ Ранг</button>'
+        +   '<button class="btn btn-sm" data-mem-act="mute" title="Мут">🔇</button>'
+        +   '<button class="btn btn-sm" data-mem-act="kick" title="Кик">👢</button>'
+        +   '<button class="btn btn-sm btn-danger" data-mem-act="ban" title="Бан">🔨</button>'
+        +   '<button class="btn btn-sm" data-mem-act="rank" title="Сменить ранг">⚙</button>'
         + '</div>'
         + '</div>';
     }).join('');
     el.querySelectorAll('.list-row[data-uid]').forEach(row => {
       const uid = row.dataset.uid, nm = row.dataset.name, rk = Number(row.dataset.rank) || 0;
+      const cb = row.querySelector('[data-bulk-toggle]');
+      cb?.addEventListener('click', e => {
+        e.stopPropagation();
+        if (MEMBERS_SELECTED.has(uid)) MEMBERS_SELECTED.delete(uid);
+        else                            MEMBERS_SELECTED.add(uid);
+        updateBulkBar();
+      });
+      row.querySelector('[data-open-profile]')?.addEventListener('click', () => openUserModal(uid));
       row.querySelectorAll('button[data-mem-act]').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', e => {
+          e.stopPropagation();
           const a = btn.dataset.memAct;
           if (a === 'mute') muteUser(uid, nm);
           else if (a === 'kick') kickUser(uid, nm);
@@ -3959,7 +4530,36 @@ async function loadMembers() {
         });
       });
     });
+    updateBulkBar();
   } catch (e) { el.innerHTML = '<div class="empty-state small">Ошибка: ' + esc(String(e)) + '</div>'; }
+}
+async function syncAdmins() {
+  showToast('Тяну админов…');
+  try {
+    const r = await apiPost('/api/sync-admins', { chat_id: CHAT_ID });
+    if (r.ok) { showToast('Подтянуто админов: ' + (r.added || 0) + ' / ' + (r.total || 0), 'success'); loadMembers(); loadStaff(); }
+    else      { showToast('Ошибка: ' + (r.error || 'unknown'), 'error'); }
+  } catch (e) { showToast('Ошибка: ' + String(e), 'error'); }
+}
+async function bulkRun(action) {
+  const ids = Array.from(MEMBERS_SELECTED);
+  if (!ids.length) return;
+  let extra = {};
+  if (action === 'mute') {
+    const sec = prompt('Длительность мута в секундах (60–86400):', '3600'); if (!sec) return;
+    extra.duration_sec = Number(sec);
+  } else if (action === 'setrank') {
+    const v = prompt('Уровень ранга (0–7):', '0'); if (v === null) return;
+    extra.level = Math.max(0, Math.min(7, Number(v))); if (isNaN(extra.level)) return;
+  }
+  if (!confirm('Применить «' + action + '» к ' + ids.length + ' юзерам?')) return;
+  showToast('Выполняю…');
+  try {
+    const r = await apiPost('/api/bulk', Object.assign({ chat_id: CHAT_ID, action, user_ids: ids }, extra));
+    showToast('Готово: ' + (r.processed || 0) + (r.errors?.length ? ' · ошибок ' + r.errors.length : ''), 'success');
+    bulkClear();
+    loadMembers();
+  } catch (e) { showToast('Ошибка: ' + String(e), 'error'); }
 }
 async function kickUser(uid, name) {
   if (!confirm('Кикнуть ' + name + '?')) return;
@@ -3990,11 +4590,15 @@ async function loadStaff() {
   el.innerHTML = '<div class="empty-state small">Загрузка…</div>';
   try {
     const d = await apiGet('/api/staff?chat_id=' + CHAT_ID);
-    if (!d.staff?.length) { el.innerHTML = '<div class="empty-state small">Стаффа пока нет</div>'; return; }
-    el.innerHTML = d.staff.map(s => {
-      return '<div class="list-row" data-uid="' + esc(s.user_id) + '" data-name="' + esc(s.name) + '" data-rank="' + (s.rank || 0) + '">'
-        + '<div class="chat-avatar" style="width:36px;height:36px;font-size:13px;border-radius:10px;flex-shrink:0">' + esc(initials(s.name)) + '</div>'
-        + '<div class="grow"><div class="list-name">' + esc(s.name) + ' ' + rankBadge(s.rank) + '</div><div class="list-sub">id ' + esc(s.user_id) + '</div></div>'
+    const head = '<div class="row mb-12"><button class="btn btn-sm" onclick="syncAdmins()">⤴ Подтянуть админов из Telegram</button></div>';
+    if (!d.staff?.length) { el.innerHTML = head + '<div class="empty-state small">Стаффа пока нет</div>'; return; }
+    el.innerHTML = head + d.staff.map(s => {
+      // staff endpoint не отдаёт avatar_path / status, поэтому используем
+      // тот же avatarHtml но без аватарки (упадёт в инициалы).
+      const m = { user_id: s.user_id, display_name: s.name, status: '', avatar_path: s.avatar_path || '' };
+      return '<div class="list-row clickable" data-uid="' + esc(s.user_id) + '" data-name="' + esc(s.name) + '" data-rank="' + (s.rank || 0) + '">'
+        + avatarHtml(m)
+        + '<div class="grow" data-open-profile><div class="list-name">' + esc(s.name) + ' ' + rankBadge(s.rank) + '</div><div class="list-sub">id ' + esc(s.user_id) + '</div></div>'
         + '<div class="row-actions">'
         +   '<button class="btn btn-sm" data-staff-act="rank">⚙ Ранг</button>'
         +   '<button class="btn btn-sm btn-danger" data-staff-act="unrank">✖ Снять</button>'
@@ -4002,8 +4606,10 @@ async function loadStaff() {
     }).join('');
     el.querySelectorAll('.list-row[data-uid]').forEach(row => {
       const uid = row.dataset.uid, nm = row.dataset.name, rk = Number(row.dataset.rank) || 0;
+      row.querySelector('[data-open-profile]')?.addEventListener('click', () => openUserModal(uid));
       row.querySelectorAll('button[data-staff-act]').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', e => {
+          e.stopPropagation();
           if (btn.dataset.staffAct === 'rank') setRankPrompt(uid, nm, rk);
           else if (btn.dataset.staffAct === 'unrank') setRankZero(uid, nm);
         });
@@ -4195,6 +4801,178 @@ async function editMsg(mid) {
     else showToast(r.error || 'Ошибка', 'error');
   } catch (e) { showToast('Ошибка: ' + String(e), 'error'); }
 }
+
+// ── ANTIMAT-LOG ──────────────────────────────────────────────────
+async function loadAntimat() {
+  const el = document.getElementById('antimat-list');
+  el.innerHTML = '<div class="empty-state small">Загрузка…</div>';
+  try {
+    const d = await apiGet('/api/antimat-log?chat_id=' + CHAT_ID + '&limit=200');
+    if (!d.events?.length) {
+      el.innerHTML = '<div class="empty-state small">Пока ничего не сматчилось. '
+        + 'Включи «Анти-мат» в Настройках и добавь стоп-слова, чтобы бот начал ловить.</div>';
+      return;
+    }
+    el.innerHTML = d.events.map(e =>
+      '<div class="list-row clickable" data-uid="' + esc(e.user_id) + '">'
+      + '<div class="grow" data-open-profile>'
+      +   '<div class="list-name">' + esc(e.user_name || ('user_' + e.user_id))
+      +     ' <span class="badge badge-warn">«' + esc(e.matched) + '»</span> <span class="badge badge-gray">' + esc(e.action) + '</span></div>'
+      +   '<div class="list-sub">' + esc(fmtTime(e.ts)) + ' · id ' + esc(e.user_id) + '</div>'
+      + '</div></div>'
+    ).join('');
+    el.querySelectorAll('.list-row[data-uid]').forEach(row => {
+      const uid = row.dataset.uid;
+      row.querySelector('[data-open-profile]')?.addEventListener('click', () => openUserModal(uid));
+    });
+  } catch (e) { el.innerHTML = '<div class="empty-state small">Ошибка: ' + esc(String(e)) + '</div>'; }
+}
+
+// ── ACTIVITY CHART (на дашборде) ─────────────────────────────────
+async function loadActivity() {
+  const el = document.getElementById('activity-chart');
+  if (!el) return;
+  try {
+    const d = await apiGet('/api/activity?chat_id=' + CHAT_ID);
+    const buckets = d.buckets || [];
+    const max = Math.max(1, ...buckets);
+    if (!buckets.length || max === 0) {
+      el.innerHTML = '<div class="empty-state small" style="margin:auto">Сообщений пока нет</div>';
+      document.getElementById('activity-meta').textContent = '';
+      return;
+    }
+    el.innerHTML = buckets.map(b => {
+      const h = Math.max(2, Math.round((b / max) * 70));
+      return '<div class="activity-bar' + (b ? '' : ' empty')
+        + '" style="height:' + h + 'px" title="' + b + ' сообщ."></div>';
+    }).join('');
+    document.getElementById('activity-meta').textContent = 'всего: ' + (d.total || 0);
+  } catch {
+    el.innerHTML = '<div class="empty-state small" style="margin:auto">—</div>';
+  }
+}
+
+// ── BROADCAST ────────────────────────────────────────────────────
+async function sendBroadcast() {
+  const txt = document.getElementById('broadcast-text').value.trim();
+  if (!txt) { showToast('Введи текст', 'error'); return; }
+  const parse_mode = document.getElementById('broadcast-mode').value || null;
+  const noprev = document.getElementById('broadcast-nopreview').checked;
+  const onlyThis = document.getElementById('broadcast-only-this').checked;
+  if (!confirm('Разослать сообщение' + (onlyThis ? ' в текущий чат' : ' во ВСЕ чаты бота') + '?')) return;
+  showToast('Шлю…');
+  try {
+    const body = { text: txt };
+    if (parse_mode) body.parse_mode = parse_mode;
+    if (noprev) body.disable_web_page_preview = true;
+    if (onlyThis) body.chat_ids = [CHAT_ID];
+    const r = await apiPost('/api/broadcast', body);
+    document.getElementById('broadcast-result').textContent =
+      'Отправлено: ' + (r.sent || 0) + ' / ' + (r.total || 0)
+      + (r.errors?.length ? ' · ошибок ' + r.errors.length : '');
+    showToast('Готово', 'success');
+  } catch (e) { showToast('Ошибка: ' + String(e), 'error'); }
+}
+
+// ── EXPORT ───────────────────────────────────────────────────────
+async function exportChat() {
+  // GET /api/export отдаёт application/json + Content-Disposition. Делаем
+  // через fetch, чтобы пройти X-Bot-Password, и затем создаём blob-URL.
+  showToast('Готовлю экспорт…');
+  try {
+    const r = await apiFetch('/api/export?chat_id=' + CHAT_ID);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'chat-' + CHAT_ID + '.json';
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 5000);
+    showToast('Скачано', 'success');
+  } catch (e) { showToast('Ошибка: ' + String(e), 'error'); }
+}
+
+// ── USER MODAL ───────────────────────────────────────────────────
+async function openUserModal(uid) {
+  const modal = document.getElementById('user-modal');
+  const name = document.getElementById('um-name');
+  const sub  = document.getElementById('um-sub');
+  const av   = document.getElementById('um-avatar');
+  const body = document.getElementById('um-body');
+  name.textContent = 'Загрузка…'; sub.textContent = ''; av.innerHTML = '?';
+  body.innerHTML = '<div class="empty-state small">…</div>';
+  modal.classList.add('visible');
+  try {
+    const d = await apiGet('/api/user-info?chat_id=' + CHAT_ID + '&user_id=' + encodeURIComponent(uid));
+    const u = d.user;
+    name.textContent = u.display_name || ('user_' + u.user_id);
+    sub.textContent = (u.username ? '@' + u.username + ' · ' : '') + 'id ' + u.user_id
+      + (d.tg_status ? ' · ' + d.tg_status : '');
+    // Аватарка
+    av.innerHTML = '';
+    const m = { user_id: u.user_id, display_name: u.display_name, status: u.status, avatar_path: '/yes' };
+    av.outerHTML = avatarHtml(m).replace('class="avatar"', 'class="avatar" id="um-avatar"');
+    // Поля
+    const cells = [
+      ['Ранг', RANK_NAMES[u.rank_level] || ('lvl ' + u.rank_level)],
+      ['Варны', u.warns || 0],
+      ['Репутация', u.rep || 0],
+      ['Последний раз', u.last_seen_at ? fmtAgo(u.last_seen_at) : '—'],
+    ];
+    let html = '<div><div class="modal-section-title">Профиль</div><div class="info-grid">'
+      + cells.map(c => '<div class="info-cell"><div class="info-label">' + esc(c[0]) + '</div><div class="info-value">' + esc(String(c[1])) + '</div></div>').join('')
+      + '</div></div>';
+    // Действия — bind через addEventListener, чтобы не клеить имя юзера
+    // в onclick=… (имя может содержать кавычки и ломать аттрибут).
+    const mid = 'um-actions-' + Math.random().toString(36).slice(2);
+    html += '<div><div class="modal-section-title">Действия</div>'
+      + '<div class="row" id="' + mid + '" style="gap:6px;flex-wrap:wrap">'
+      +   '<button class="btn btn-sm" data-um-act="mute">🔇 Мут</button>'
+      +   '<button class="btn btn-sm" data-um-act="kick">👢 Кик</button>'
+      +   '<button class="btn btn-sm btn-danger" data-um-act="ban">🔨 Бан</button>'
+      +   '<button class="btn btn-sm" data-um-act="rank">⚙ Ранг</button>'
+      + '</div></div>';
+    // Анти-мат события
+    if (d.antimat_events?.length) {
+      html += '<div><div class="modal-section-title">Антимат-история</div>'
+        + d.antimat_events.map(e =>
+            '<div class="list-row"><div class="grow"><div class="list-name">«' + esc(e.matched) + '» → '
+            + esc(e.action) + '</div><div class="list-sub">' + esc(fmtTime(e.ts)) + '</div></div></div>'
+          ).join('')
+        + '</div>';
+    }
+    // Последние сообщения
+    if (d.recent_messages?.length) {
+      html += '<div><div class="modal-section-title">Последние сообщения</div>'
+        + d.recent_messages.map(m =>
+            '<div class="list-row"><div class="grow"><div class="list-name" style="font-weight:400">'
+            + esc(m.text || ('[' + m.kind + ']')) + '</div><div class="list-sub">'
+            + esc(fmtTime(m.ts)) + ' · id ' + esc(m.message_id) + '</div></div></div>'
+          ).join('')
+        + '</div>';
+    }
+    body.innerHTML = html;
+    const actBox = document.getElementById(mid);
+    actBox?.querySelectorAll('button[data-um-act]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const a  = btn.dataset.umAct;
+        const id = u.user_id;
+        const nm = u.display_name || ('user_' + u.user_id);
+        const rk = u.rank_level || 0;
+        if (a === 'mute') muteUser(id, nm);
+        else if (a === 'kick') kickUser(id, nm);
+        else if (a === 'ban')  banUser(id, nm);
+        else if (a === 'rank') setRankPrompt(id, nm, rk);
+      });
+    });
+  } catch (e) { body.innerHTML = '<div class="empty-state small">Ошибка: ' + esc(String(e)) + '</div>'; }
+}
+function closeUserModal() {
+  document.getElementById('user-modal').classList.remove('visible');
+}
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeUserModal();
+});
 </script>
 </body>
 </html>

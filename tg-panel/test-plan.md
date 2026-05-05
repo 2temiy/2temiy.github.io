@@ -22,10 +22,11 @@ The fix replaces inline `onclick` handlers with `addEventListener` + `data-*` at
 - **Expected pass:** `#login-screen` is hidden, `#app` is visible, `#chat-picker` shows two cards labelled "Главный чат" and "Тест канал".
 - **Would-fail-if-broken:** With a broken `enterApp()` or auth, password submission either errors or the chat grid renders empty.
 
-### T2 — Clicking a chat opens the management panel on Dashboard tab
-- **Action:** Click the "Главный чат" card.
+### T2 — Clicking a chat opens the management panel on Dashboard tab (also verifies the duplicate-API-call fix from `5321259`)
+- **Action:** Click the "Главный чат" card. Before clicking, instrument `window.__chatInfoCalls = 0` and wrap `fetch` to increment when the URL contains `/api/chat-info`.
 - **Expected pass:** `#chat-picker` hides, `#chat-panel` shows. Active tab is "📊 Дашборд". Stat tiles populated: `Сообщений (лог) = 4`, `Варны (всего) = 7`, `Участники = 1 234`, `Стафф = 3`. "Топ нарушителей" panel shows ≥1 row. "Информация о чате" panel shows title and type badge.
-- **Would-fail-if-broken:** If `enterChat()` doesn't pass `c` correctly, stat tiles stay `—`. If `loadStats()` is broken, "Топ нарушителей" stays empty.
+- **Critical assertion (5321259):** `window.__chatInfoCalls === 1` — exactly one `/api/chat-info` request, not two. Before the fix `enterChat()` called `loadChatInfo()` directly AND `showTab('dashboard')` called it again, producing two concurrent requests with a race on the title/desc input fields.
+- **Would-fail-if-broken:** If `enterChat()` doesn't pass `c` correctly, stat tiles stay `—`. If `loadStats()` is broken, "Топ нарушителей" stays empty. If the duplicate call regression returns, `__chatInfoCalls === 2`.
 
 ### T3 — Feed tab shows mock messages and auto-refresh updates them
 - **Action:** Click "💬 Лента" tab.
@@ -68,6 +69,16 @@ The fix replaces inline `onclick` handlers with `addEventListener` + `data-*` at
   - DOM inspection: the card uses `data-chat-idx="2"` (no embedded JSON in `onclick`).
   - Clicking the card calls `enterChat(CHATS_LIST[2])` with the literal object — observable as the card opening the per-chat panel without firing `alert`.
 - **Would-fail-if-broken:** In the previous build, `JSON.stringify(c).replace(/"/g, '&quot;')` produced an `onclick` attribute whose `&#34;` sequences were decoded by the HTML parser into bare `"` characters, breaking out of the JS string and executing `alert('XSS_FROM_TITLE')`.
+
+### T9 — POST /api/rules?chat_id=X is no longer shadowed by the GET handler (commit `5321259`)
+- **Critical assertion of the routing fix.**
+- **Action:** Run two `curl` calls against the local mock with the password in the URL:
+  1. `curl -sS -X POST 'http://127.0.0.1:8088/api/rules?chat_id=-1001&pwd=testpass' -H 'content-type: application/json' -d '{"text":"NEW_RULES"}'`
+  2. `curl -sS 'http://127.0.0.1:8088/api/rules?chat_id=-1001&pwd=testpass'`
+- **Expected pass:**
+  - First call returns `{"ok":true,"saved":true}` (POST handler ran, body persisted into `STATE.last_saved_rules`).
+  - The mock matches the production worker.js routing: GET handlers are guarded by `request.method === "GET"`, so a POST with `chat_id` in the URL falls through to the POST handler.
+- **Would-fail-if-broken:** Pre-fix, the GET handler matched first because of `path === "/api/rules" && chatId` with no method check, returning the existing rules text and silently dropping the save. The mock's old behavior (without the POST arm we just added) would also expose this — included as belt-and-suspenders against future regressions.
 
 ## Skipped / out of scope
 - Real Telegram delivery (no live bot). Send/Kick/Ban only verified end-to-end against the mock — confirms the dashboard wires the API call, not Telegram-side semantics.

@@ -218,8 +218,75 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/members":
             qs = (q.get("q") or "").lower()
+            sort = q.get("sort", "rank")
             ms = [m for m in MEMBERS if not qs or qs in (m["display_name"] or "").lower()]
-            return jbody(self, 200, {"ok": True, "members": ms})
+            # enrich with last_seen_at / status / avatar_path so the new UI
+            # exercises avatar+status-dot rendering paths.
+            for i, m in enumerate(ms):
+                m.setdefault("last_seen_at", START_TS - 60 * (i + 1))
+                m.setdefault("status", ["member", "administrator", "creator", "left"][i % 4])
+                m.setdefault("avatar_path", "")  # empty → fallback to initials
+            keyfns = {
+                "rank":   lambda m: -(m.get("rank_level") or 0),
+                "recent": lambda m: -(m.get("last_seen_at") or 0),
+                "warns":  lambda m: -(m.get("warns") or 0),
+                "rep":    lambda m: -(m.get("rep") or 0),
+                "name":   lambda m: (m.get("display_name") or "").lower(),
+            }
+            ms = sorted(ms, key=keyfns.get(sort, keyfns["rank"]))
+            return jbody(self, 200, {"ok": True, "members": ms, "total": len(MEMBERS)})
+
+        if path == "/api/avatar":
+            # standalone мок не имеет картинок — отдаём 404, дашборд должен
+            # упасть в инициалы через avatarFallback().
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"no avatar")
+            return
+
+        if path == "/api/user-info":
+            uid = q.get("user_id", "")
+            u = next((m for m in MEMBERS if m["user_id"] == uid), None)
+            if not u:
+                return jbody(self, 200, {"ok": True, "user": {
+                    "user_id": uid, "display_name": "user_" + uid, "username": "",
+                    "warns": 0, "rep": 0, "rank_level": 0, "status": "", "last_seen_at": 0,
+                }, "antimat_events": [], "recent_messages": []})
+            user = dict(u)
+            user.setdefault("status", "member")
+            user.setdefault("last_seen_at", START_TS - 600)
+            return jbody(self, 200, {
+                "ok": True,
+                "user": user,
+                "tg_status": "member",
+                "antimat_events": [
+                    {"matched": "слово1", "action": "варн 1/3", "ts": START_TS - 300},
+                    {"matched": "слово2", "action": "бан",      "ts": START_TS - 200},
+                ],
+                "recent_messages": [
+                    {"message_id": 991, "kind": "text", "text": "Привет всем", "ts": START_TS - 100},
+                    {"message_id": 992, "kind": "text", "text": "Йо",          "ts": START_TS - 60},
+                ],
+            })
+
+        if path == "/api/antimat-log":
+            return jbody(self, 200, {"ok": True, "events": [
+                {"user_id": "1002", "user_name": "Bob", "matched": "слово1", "action": "варн 1/3", "ts": START_TS - 300},
+                {"user_id": "9001", "user_name": "');alert('XSS_FROM_NAME');//", "matched": "слово2", "action": "бан", "ts": START_TS - 200},
+            ]})
+
+        if path == "/api/activity":
+            buckets = [0, 0, 1, 3, 7, 12, 18, 22, 25, 19, 14, 9, 6, 4, 3, 5, 8, 11, 16, 14, 10, 6, 3, 1]
+            return jbody(self, 200, {"ok": True, "buckets": buckets, "total": sum(buckets)})
+
+        if path == "/api/export":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Disposition", 'attachment; filename="chat-mock.json"')
+            self.end_headers()
+            self.wfile.write(json.dumps({"chat_id": "mock", "members": MEMBERS}, ensure_ascii=False, indent=2).encode("utf-8"))
+            return
 
         if path == "/api/staff":
             return jbody(self, 200, {"ok": True, "staff": STAFF})
@@ -317,6 +384,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/refresh-chats":
             return jbody(self, 200, {"ok": True, "chats": CHATS})
 
+        # Mirror worker.js: POST /api/rules saves rules text. Used by T9 to
+        # verify the GET handler no longer shadows the POST when chat_id is in
+        # the URL query.
+        if path == "/api/rules":
+            STATE["last_saved_rules"] = data.get("text", "")
+            return jbody(self, 200, {"ok": True, "saved": True})
+
         if path == "/api/send-message":
             new_id = STATE["next_msg_id"]
             STATE["next_msg_id"] += 1
@@ -335,11 +409,22 @@ class Handler(BaseHTTPRequestHandler):
             STATE["messages"] = [m for m in STATE["messages"] if m["message_id"] != mid]
             return jbody(self, 200, {"ok": True})
 
+        if path == "/api/sync-admins":
+            return jbody(self, 200, {"ok": True, "added": 2, "total": 3})
+
+        if path == "/api/bulk":
+            ids = data.get("user_ids", []) or []
+            return jbody(self, 200, {"ok": True, "processed": len(ids), "errors": []})
+
+        if path == "/api/broadcast":
+            chat_ids = data.get("chat_ids") or [c["chat_id"] for c in CHATS]
+            return jbody(self, 200, {"ok": True, "sent": len(chat_ids), "total": len(chat_ids), "errors": []})
+
         # All moderation actions just echo ok
         if path in ("/api/kick", "/api/ban", "/api/unban", "/api/mute", "/api/unmute",
                     "/api/setrank", "/api/edit-chat", "/api/pin", "/api/unpin",
                     "/api/save-rules", "/api/save-welcome", "/api/save-badwords",
-                    "/api/save-settings", "/api/delete-chat"):
+                    "/api/save-settings", "/api/delete-chat", "/api/purge-chat"):
             return jbody(self, 200, {"ok": True, "echo": data})
 
         return jbody(self, 200, {"ok": True, "stub": path})
