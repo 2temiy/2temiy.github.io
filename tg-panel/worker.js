@@ -4835,7 +4835,10 @@ async function loadActivity() {
   try {
     const d = await apiGet('/api/activity?chat_id=' + CHAT_ID);
     const buckets = d.buckets || [];
-    const max = Math.max(1, ...buckets);
+    // Use Math.max(0, ...) so the empty-state check below is reachable when
+    // the API returns all-zero buckets. The division-by-zero guard now only
+    // applies in the rendering path where max>0 by construction.
+    const max = buckets.length ? Math.max(0, ...buckets) : 0;
     if (!buckets.length || max === 0) {
       el.innerHTML = '<div class="empty-state small" style="margin:auto">Сообщений пока нет</div>';
       document.getElementById('activity-meta').textContent = '';
