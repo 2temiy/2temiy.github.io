@@ -4391,6 +4391,10 @@ function doLogin() {
 }
 function enterApp() {
   document.getElementById('login-screen').style.display = 'none';
+  // Сброс возможной «Неверный пароль» плашки от прошлой попытки входа
+  // — иначе после «плохой пароль → правильный пароль → logout» юзер увидит
+  // старую ошибку на чистом входном экране.
+  document.getElementById('login-err').style.display = 'none';
   document.getElementById('app').style.display = 'block';
   loadBotName();
   showChatPicker();
@@ -4473,6 +4477,10 @@ function renderCrumbs() {
 function showChatPicker() {
   CHAT_ID = ''; CURRENT_CHAT = null;
   if (FEED_TIMER) { clearInterval(FEED_TIMER); FEED_TIMER = null; }
+  // На всякий случай чистим bulk-селект и при возврате в пикер —
+  // в паре с чисткой в enterChat() это исключает утечку выделения
+  // между сессиями чатов.
+  MEMBERS_SELECTED.clear();
   document.getElementById('chat-picker').style.display = 'block';
   document.getElementById('chat-panel').style.display = 'none';
   renderCrumbs();
@@ -4534,6 +4542,11 @@ async function refreshAllChats() {
 function enterChat(c) {
   CURRENT_CHAT = c;
   CHAT_ID = c.chat_id;
+  // ОБЯЗАТЕЛЬНО сбросить bulk-селект при смене чата. Набор user_id это
+  // плоские риббоны без chat_id, и если юзер выбрал людей в чате A,
+  // вернулся в пикер и вошёл в чат B — bulk-bar покажет «N выбрано» и при
+  // клике «Бан» /api/bulk пойдёт банить этих юзеров в чате B. Необратимо.
+  MEMBERS_SELECTED.clear();
   document.getElementById('chat-picker').style.display = 'none';
   document.getElementById('chat-panel').style.display = 'block';
   renderCrumbs();
